@@ -8,7 +8,7 @@ import { OrcaCli, type OrcaApi } from './orca.ts';
 import { disabledOrchestration, OrcaOrchestration, type OrchestrationApi } from './orchestration.ts';
 import { recoverStrandedCards, type RecoveryReport } from './recovery.ts';
 import { Scheduler } from './scheduler.ts';
-import type { KanbanConfig } from './types.ts';
+import type { Card, CardState, KanbanConfig } from './types.ts';
 
 export type App = {
 	board: Board;
@@ -17,6 +17,11 @@ export type App = {
 	orchestration: OrchestrationApi;
 	scheduler: Scheduler;
 	log: Logger;
+	/**
+	 * Reflects a card's current state onto its Orca worktree. Manual moves from the
+	 * CLI and the UI go through here, so Orca's board never drifts from SQLite.
+	 */
+	mirrorCard: (card: Card, comment?: string) => Promise<void>;
 	recover: () => Promise<RecoveryReport>;
 	close: () => void;
 };
@@ -54,14 +59,16 @@ export function createApp(
 		lookupCard: (id) => board.getCard(id),
 	});
 
+	const mirror = async (card: Card, state: CardState, comment?: string): Promise<void> => {
+		await mirrorCardToOrca({ orca, config, log, card, state, comment: commentForCard(card, comment) });
+	};
+
 	const scheduler = new Scheduler({
 		board,
 		config,
 		executor,
 		log,
-		mirror: async (card, state, comment) => {
-			await mirrorCardToOrca({ orca, config, log, card, state, comment: commentForCard(card, comment) });
-		},
+		mirror,
 	});
 
 	return {
@@ -71,6 +78,7 @@ export function createApp(
 		orchestration,
 		scheduler,
 		log,
+		mirrorCard: (card, comment) => mirror(card, card.state, comment),
 		recover: async () => {
 			const report = await recoverStrandedCards({ board, orca, config, log });
 			// Re-attach anything still alive so its work is not thrown away.

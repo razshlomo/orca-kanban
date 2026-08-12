@@ -147,7 +147,10 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 
 		if (!action && method === 'PATCH') {
 			const body = await readBody(req);
-			send(res, 200, { card: app.board.updateCard(id, cardInputFrom(body)) });
+			const updated = app.board.updateCard(id, cardInputFrom(body));
+			// An edit that changes state must move the Orca card too.
+			if (updated && updated.state !== card.state) await app.mirrorCard(updated);
+			send(res, 200, { card: updated });
 			return;
 		}
 
@@ -161,6 +164,7 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 			const state = body['state'];
 			if (!isCardState(state)) return send(res, 400, { error: 'state must be a valid board state' });
 			const moved = app.board.moveCard(id, state, num(body['order']));
+			if (moved) await app.mirrorCard(moved);
 			send(res, 200, { card: moved });
 			return;
 		}
@@ -168,7 +172,9 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 		if (action === '/retry' && method === 'POST') {
 			const body = await readBody(req);
 			const resetAttempts = body['resetAttempts'] !== false;
-			send(res, 200, { card: app.board.retryCard(id, { resetAttempts }) });
+			const retried = app.board.retryCard(id, { resetAttempts });
+			if (retried) await app.mirrorCard(retried, 'retry requested');
+			send(res, 200, { card: retried });
 			return;
 		}
 

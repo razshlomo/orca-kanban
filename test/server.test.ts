@@ -209,3 +209,118 @@ test('an unknown route is a clean 404', async () => {
 		await h.stop();
 	}
 });
+
+/**
+ * A harness with mirroring on, exposing the Orca fake so the board writes can be
+ * inspected. Regression cover for manual state changes drifting from Orca's board.
+ */
+async function mirrorHarness(): Promise<Harness & { app: ReturnType<typeof createApp>; orca: ReturnType<typeof fakeOrca> }> {
+	const { dbPath } = testEnv();
+	const orca = fakeOrca();
+	const app = createApp({
+		dbPath,
+		orca,
+		orchestration: fakeOrchestration,
+		log: silentLogger,
+		config: {
+			pollIntervalMs: 100,
+			mirrorToOrcaBoard: true,
+			orchestration: { enabled: false, objective: 'test', runId: null },
+		},
+	});
+
+	const server = createHttpServer(app);
+	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+	const { port } = server.address() as AddressInfo;
+	const base = `http://127.0.0.1:${port}`;
+
+	return {
+		base,
+		app,
+		orca,
+		stop: async () => {
+			await app.scheduler.stop();
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			app.close();
+		},
+		call: async <T,>(path: string, method = 'GET', body?: unknown) => {
+			const res = await fetch(`${base}${path}`, {
+				method,
+				headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+				body: body === undefined ? undefined : JSON.stringify(body),
+			});
+			return { status: res.status, json: (await res.json()) as T };
+		},
+	};
+}
+
+/** Gives a card the worktree it would have after a run, so it exists on Orca's board. */
+function withWorktree(app: ReturnType<typeof createApp>, card: Card): Card {
+	app.board.attachSession(card.id, {
+		sessionId: 'term_mirror',
+		worktreeId: 'repo::/tmp/wt',
+		worktreePath: '/tmp/wt',
+		branch: 'card-branch',
+	});
+	return app.board.getCard(card.id) as Card;
+}
+
+test('a card moved by hand is mirrored onto Orca board, not just SQLite', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = withWorktree(h.app, h.app.board.createCard({ title: 'reviewed work', state: 'Review' }));
+
+		const res = await h.call<CardResponse>(`/api/cards/${card.id}/move`, 'POST', { state: 'Done' });
+		assert.equal(res.json.card.state, 'Done');
+
+		const write = h.orca.statusWrites.at(-1);
+		assert.equal(write?.selector, 'id:repo::/tmp/wt', 'the card own worktree is targeted');
+		assert.equal(write?.workspaceStatus, 'completed', 'Done maps to the completed column');
+		assert.match(String(write?.comment), new RegExp(card.id), 'the comment identifies the card');
+	} finally {
+		await h.stop();
+	}
+});
+
+test('an edit that changes state mirrors, and one that does not leaves the board alone', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = withWorktree(h.app, h.app.board.createCard({ title: 'x', state: 'Review' }));
+
+		await h.call<CardResponse>(`/api/cards/${card.id}`, 'PATCH', { title: 'renamed only' });
+		assert.equal(h.orca.statusWrites.length, 0, 'a title edit is not a board move');
+
+		await h.call<CardResponse>(`/api/cards/${card.id}`, 'PATCH', { state: 'Blocked' });
+		assert.equal(h.orca.statusWrites.at(-1)?.workspaceStatus, 'blocked');
+	} finally {
+		await h.stop();
+	}
+});
+
+test('retrying a card moves its Orca card back to the ready column', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = withWorktree(h.app, h.app.board.createCard({ title: 'failed work', state: 'Blocked' }));
+
+		await h.call<CardResponse>(`/api/cards/${card.id}/retry`, 'POST', {});
+
+		const write = h.orca.statusWrites.at(-1);
+		assert.equal(write?.workspaceStatus, 'ready');
+		assert.match(String(write?.comment), /retry requested/);
+	} finally {
+		await h.stop();
+	}
+});
+
+test('a card that never ran has no Orca worktree, so a move is a silent no-op', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = h.app.board.createCard({ title: 'never ran', state: 'Ready' });
+
+		const res = await h.call<CardResponse>(`/api/cards/${card.id}/move`, 'POST', { state: 'Done' });
+		assert.equal(res.json.card.state, 'Done', 'the board move still succeeds');
+		assert.equal(h.orca.statusWrites.length, 0, 'nothing is written to Orca for a card it never saw');
+	} finally {
+		await h.stop();
+	}
+});

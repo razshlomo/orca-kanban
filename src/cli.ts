@@ -217,6 +217,7 @@ async function main(): Promise<number> {
 				if (!id) throw new Error('a card id is required');
 				const card = app.board.moveCard(id, state);
 				if (!card) throw new Error(`no such card ${id}`);
+				await app.mirrorCard(card);
 				process.stdout.write(`${card.id} -> ${card.state}\n`);
 				return 0;
 			}
@@ -233,6 +234,7 @@ async function main(): Promise<number> {
 				if (!id) throw new Error('a card id is required');
 				const card = app.board.retryCard(id);
 				if (!card) throw new Error(`no such card ${id}`);
+				await app.mirrorCard(card, 'retry requested');
 				process.stdout.write(`${card.id} -> ${card.state} (attempts reset)\n`);
 				return 0;
 			}

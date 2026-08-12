@@ -45,7 +45,10 @@ file is the only way to distinguish "blocked" from "needs review".
 ### Card states → Orca board columns
 
 The SQLite board is authoritative; each card is mirrored onto its Orca worktree so it
-appears in the right column of Orca's own workspace board.
+appears in the right column of Orca's own workspace board. Every state change mirrors —
+the scheduler's own transitions, and manual moves from the CLI, the UI and the API — so
+the two boards cannot drift. Cards that have never run have no worktree yet, so they
+exist only on the SQLite board until their first attempt.
 
 | Card state | Orca `workspaceStatus` |
 | --- | --- |
@@ -341,7 +344,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 84 tests
+npm test          # 88 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```
