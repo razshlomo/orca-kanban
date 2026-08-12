@@ -250,6 +250,80 @@ hard ceiling per attempt.
 
 ---
 
+## Reviewing a card
+
+With the default `successState: "Review"` a finished card **stops** and waits for a
+human. Nothing advances it on its own, because eligibility requires `state == Ready`.
+
+Look at what the agent actually produced:
+
+```bash
+kanban card diff <id>          # the full patch, new files included
+kanban card open <id>          # open those changes as diffs in Orca
+kanban card open <id> --session  # jump to the agent's own terminal tab
+```
+
+`card diff` exists because `git diff` alone is misleading here: agents do not commit by
+default, so their work is usually **untracked** and invisible to a plain diff. The patch
+is measured from the merge-base and renders new files as additions.
+
+Then decide:
+
+```bash
+kanban card approve <id> -m "matches the spec"
+kanban card reject  <id> -m "mode() must return a number, not an array"
+kanban card comment <id> "a question that is not a verdict"
+```
+
+| Action | Card goes to | Effect |
+| --- | --- | --- |
+| `approve` | Done | Verdict recorded in the review trail. |
+| `reject` | Ready | Retry budget restored, **and your reason is injected into the next agent's prompt**. |
+| `comment` | unchanged | A note on the trail; the next agent reads it too. |
+
+A rejection **requires** a reason, and refuses without one. That reason is the whole
+mechanism: a rejected card gets a brand-new agent session with no memory, so the words
+you write are the only thing that travels. The next prompt gains:
+
+```
+Previous attempt on this card:
+Attempt 1 ended as DONE.
+What that attempt reported: …
+
+Review history, oldest first. The most recent CHANGES REQUESTED is why this card
+came back to you — address it specifically:
+* [CHANGES REQUESTED] human: mode() must return a number, not an array
+```
+
+The trail lives in `card_comments`, is append-only, and is visible in the UI card panel
+beside an inline diff and the two "open in Orca" buttons.
+
+### Plan first, then implement
+
+To put a human decision *before* the work, use two cards and a dependency — no special
+feature needed. The implementation card is ineligible until you approve the plan:
+
+```bash
+PLAN=$(kanban card add "Plan: statistics helpers" \
+  --description "Produce a plan only. Write it to PLAN.md. Do not write implementation code." \
+  --state Ready --priority 20 --repo /path/to/repo | awk '{print $1}')
+
+kanban card add "Implement the approved plan" \
+  --description "PLAN.md was reviewed and approved by a human. Treat it as the spec." \
+  --state Ready --priority 10 --deps "$PLAN" --repo /path/to/repo
+```
+
+Run the board: the plan card executes, lands in Review, and the scheduler then reports
+`no eligible cards` — it will not implement anything until you move the plan card to
+Done.
+
+> **Approving means landing the artifact.** Every card gets a *fresh worktree from the
+> base branch*, so an uncommitted `PLAN.md` sitting in the planner's worktree is
+> invisible to the next card. Commit it (and merge it to the base branch) as part of
+> approving, or the implementer is told to follow a spec it cannot read.
+
+---
+
 ## Recovering and retrying cards
 
 A card that fails is returned to **Ready** while `attemptCount < maxAttempts`, and moves
@@ -287,10 +361,16 @@ kanban recover        # or POST /api/scheduler/recover
 
 Six columns with drag-and-drop, card create/edit/delete, priority and order,
 dependencies, agent and repo per card, retry, run history, live scheduler status with the
-current card and Orca session id, and all five scheduler controls.
+current card and Orca session id, and all five scheduler controls. The auto-run button is
+a toggle that reflects the scheduler's real state rather than a fixed label.
 
-It is intentionally minimal: Orca's own workspace board already shows each card's column,
-progress comment, and agent, so this UI only adds what Orca has no columns for.
+Selecting a card opens a review panel: an inline diff of what the agent produced,
+**Open changes in Orca** and **Open session** buttons, a comment box, **Approve** and
+**Request changes**, and the card's append-only review trail.
+
+It is otherwise intentionally minimal: Orca's own workspace board already shows each
+card's column, progress comment, and agent, so this UI only adds what Orca has no
+columns for.
 
 ---
 
@@ -304,6 +384,11 @@ progress comment, and agent, so this UI only adds what Orca has no columns for.
 | POST | `/api/cards/:id/move` | `{ "state": "Ready", "order": 3 }` |
 | POST | `/api/cards/:id/retry` | restore retry budget |
 | GET | `/api/cards/:id/runs` | run history |
+| POST | `/api/cards/:id/approve` | accept the work → Done |
+| POST | `/api/cards/:id/reject` | send it back → Ready, reason required |
+| GET/POST | `/api/cards/:id/comments` | read or append to the review trail |
+| GET | `/api/cards/:id/diff` | the card patch, untracked files included |
+| POST | `/api/cards/:id/open` | open `changes` or `session` in Orca |
 | POST | `/api/cards/reorder` | `{ "ids": [...] }` |
 | POST | `/api/scheduler/{start,pause,autorun,stop-after-current,stop-current,run-once,recover}` | controls |
 
@@ -344,7 +429,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 90 tests
+npm test          # 108 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```
@@ -387,6 +472,14 @@ recovery. `scripts/smoke.ts` reproduces the same scenario against real OMP agent
 10. **Custom board columns** (`backlog`, `ready`, `blocked`) are accepted by the CLI, but
     to see them as real columns you may need to configure them in Orca's board settings;
     otherwise remap via `orcaStatusMap`.
+11. **A rejected card gets a *new* worktree, not its old one.** Orca de-duplicates the
+    worktree name (`…-<cardId>-2`), so the second attempt starts from the base branch and
+    the previous attempt's uncommitted work stays behind in the first worktree. The agent
+    is not lost — it receives the previous summary and your reason in the prompt — but it
+    rebuilds rather than edits, and the old worktree remains until you remove it.
+12. **Agent artifacts must be committed to cross a card boundary.** A file written but not
+    committed is invisible to the next card, since each card gets a fresh worktree from
+    the base branch.
 
 ---
 

@@ -13,6 +13,11 @@ board", "queue this", "break this into cards", or asks what is on the board, use
 - Run it: `kanban run --once` (one card) or `kanban serve` (board UI + auto-run).
 - Fix stuck work: `kanban card retry <id>`, `kanban card move <id> <state>`, `kanban recover`.
 
+A finished card waits in **Review** for a human. `kanban card approve` and
+`kanban card reject` are the human's verdict — never run them on your own work.
+`kanban card diff <id>` and `kanban card open <id>` help a human review; when they
+dictate a rejection, pass their reason through verbatim with `-m`.
+
 "Create a ticket" / "FR" / "Jira" means **Jira**, not this board.
 
 **If the current directory or any parent contains `.orca-kanban/card.json`, you are

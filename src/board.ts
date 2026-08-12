@@ -4,6 +4,8 @@ import { immediateTransaction, openDb, type Db, type SqlValue } from './db.ts';
 import type {
 	AgentStatus,
 	Card,
+	CardBackstory,
+	CardComment,
 	CardInput,
 	CardRun,
 	CardState,
@@ -13,6 +15,17 @@ import type {
 } from './types.ts';
 
 type Row = Record<string, unknown>;
+
+function rowToComment(row: Row): CardComment {
+	return {
+		id: String(row['id']),
+		cardId: String(row['card_id']),
+		kind: String(row['kind']) as CardComment['kind'],
+		author: String(row['author']),
+		body: String(row['body'] ?? ''),
+		createdAt: Number(row['created_at']),
+	};
+}
 
 function rowToCard(row: Row): Card {
 	let dependencies: string[] = [];
@@ -308,6 +321,89 @@ export class Board extends EventEmitter {
 
 		this.touched('card_retry', id);
 		return this.getCard(id);
+	}
+
+	// --------------------------------------------------------------- review
+
+	/**
+	 * Records a reviewer's words on a card. Append-only: an approval or rejection
+	 * keeps its reason forever, and the next agent gets to read it.
+	 */
+	addComment(cardId: string, body: string, options: { kind?: CardComment['kind']; author?: string } = {}): CardComment | null {
+		if (!this.getCard(cardId)) return null;
+
+		const comment: CardComment = {
+			id: `cmt_${randomUUID().slice(0, 8)}`,
+			cardId,
+			kind: options.kind ?? 'comment',
+			author: options.author ?? 'human',
+			body,
+			createdAt: Date.now(),
+		};
+
+		this.db
+			.prepare('INSERT INTO card_comments (id, card_id, kind, author, body, created_at) VALUES (?,?,?,?,?,?)')
+			.run(comment.id, comment.cardId, comment.kind, comment.author, comment.body, comment.createdAt);
+
+		this.touched('card_commented', cardId);
+		return comment;
+	}
+
+	/** The whole review trail for a card, oldest first. */
+	commentsForCard(cardId: string): CardComment[] {
+		// rowid breaks ties in true insertion order. Sorting by `id` looked fine but is a
+		// random UUID, so two comments in the same millisecond came back in random order —
+		// and "the most recent CHANGES REQUESTED" would then be a coin toss.
+		return this.db
+			.prepare('SELECT * FROM card_comments WHERE card_id = ? ORDER BY created_at ASC, rowid ASC')
+			.all(cardId)
+			.map((row) => rowToComment(row as Row));
+	}
+
+	/**
+	 * Accepts the work: the card lands in `state` (Done by default) with the
+	 * approval recorded. The reviewer's decision is the only way out of Review.
+	 */
+	approveCard(id: string, options: { comment?: string; state?: CardState; author?: string } = {}): Card | null {
+		const card = this.getCard(id);
+		if (!card) return null;
+
+		this.addComment(id, options.comment?.trim() || 'Approved.', { kind: 'approved', author: options.author ?? 'human' });
+		return this.moveCard(id, options.state ?? 'Done');
+	}
+
+	/**
+	 * Sends the work back for another attempt with the reason attached, so the next
+	 * agent session starts knowing what was wrong. Restores the retry budget,
+	 * because a human asking for changes is not one of the card's own failures.
+	 */
+	rejectCard(id: string, feedback: string, options: { author?: string; state?: CardState } = {}): Card | null {
+		const card = this.getCard(id);
+		if (!card) return null;
+
+		const reason = feedback.trim();
+		if (!reason) throw new Error('a rejection needs a reason — that reason is what the next agent reads');
+
+		this.addComment(id, reason, { kind: 'rejected', author: options.author ?? 'human' });
+
+		if (options.state && options.state !== 'Ready') return this.moveCard(id, options.state);
+		return this.retryCard(id, { resetAttempts: true });
+	}
+
+	/**
+	 * What a fresh agent should be told about the card's past: every comment, plus
+	 * how the last attempt ended.
+	 */
+	backstoryFor(cardId: string): CardBackstory {
+		const runs = this.runsForCard(cardId);
+		const last = runs.find((r) => r.finishedAt !== null) ?? null;
+
+		return {
+			comments: this.commentsForCard(cardId),
+			previousAttempt: last
+				? { attempt: runs.filter((r) => r.finishedAt !== null).length, status: last.status, summary: last.summary, error: last.error }
+				: null,
+		};
 	}
 
 	// ---------------------------------------------------------------- claim

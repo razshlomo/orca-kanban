@@ -140,6 +140,22 @@ kanban card show <id>
 Each card is mirrored onto its Orca worktree, so it also appears in the matching
 column of Orca's own workspace board.
 
+## Review is the human's call, not yours
+
+A finished card stops in **Review**. `kanban card approve` and `kanban card reject`
+represent a human's verdict — never run them to clear your own work, or work you
+just asked an agent to do. You may help the human review:
+
+```bash
+kanban card diff <id>            # the patch, including files the agent never staged
+kanban card open <id>            # open those changes as diffs in Orca
+kanban card comment <id> "…"     # add a note without deciding anything
+```
+
+If the user says to approve or reject, pass their words through verbatim with
+`-m`, because a rejection reason is injected into the next agent's prompt and is
+the only thing that survives into the retry.
+
 ## Reporting back
 
 After changing the board, tell the user exactly what changed: the card ids, their

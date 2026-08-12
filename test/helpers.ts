@@ -204,6 +204,15 @@ export function fakeOrca(options: FakeOrcaOptions = {}): FakeOrca {
 		async terminalClose(opts) {
 			calls.push(`terminalClose:${opts.handle}`);
 		},
+		async terminalSwitch(handle) {
+			calls.push(`terminalSwitch:${handle}`);
+		},
+		async fileOpenChanged(opts) {
+			calls.push(`fileOpenChanged:${opts.worktreeSelector}:${opts.mode ?? 'diff'}`);
+		},
+		async fileOpen(opts) {
+			calls.push(`fileOpen:${opts.path}`);
+		},
 	};
 
 	return api;

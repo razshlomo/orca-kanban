@@ -324,3 +324,109 @@ test('a card that never ran has no Orca worktree, so a move is a silent no-op', 
 		await h.stop();
 	}
 });
+
+type CommentsResponse = { comments: Array<{ kind: string; body: string }> };
+type DiffResponse = { diff: { untracked: string[]; patch: string } | null; reason?: string };
+type OpenResponse = { opened: string };
+
+test('approving over HTTP records the verdict and moves the Orca card to completed', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = withWorktree(h.app, h.app.board.createCard({ title: 'x', state: 'Review' }));
+
+		const res = await h.call<CardResponse>(`/api/cards/${card.id}/approve`, 'POST', { comment: 'looks right' });
+		assert.equal(res.json.card.state, 'Done');
+		assert.equal(h.orca.statusWrites.at(-1)?.workspaceStatus, 'completed');
+
+		const trail = await h.call<CommentsResponse>(`/api/cards/${card.id}/comments`);
+		assert.deepEqual(trail.json.comments.at(-1), { ...trail.json.comments.at(-1), kind: 'approved', body: 'looks right' });
+	} finally {
+		await h.stop();
+	}
+});
+
+test('a rejection without a reason is a 400 and leaves the card in Review', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = withWorktree(h.app, h.app.board.createCard({ title: 'x', state: 'Review' }));
+
+		const res = await h.call<ErrorResponse>(`/api/cards/${card.id}/reject`, 'POST', { comment: '  ' });
+		assert.equal(res.status, 400);
+		assert.match(res.json.error, /next agent/);
+		assert.equal(h.app.board.getCard(card.id)?.state, 'Review');
+	} finally {
+		await h.stop();
+	}
+});
+
+test('rejecting over HTTP sends the card back to Ready with the reason attached', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = withWorktree(h.app, h.app.board.createCard({ title: 'x', state: 'Review' }));
+
+		const res = await h.call<CardResponse>(`/api/cards/${card.id}/reject`, 'POST', { comment: 'wrong return type' });
+		assert.equal(res.json.card.state, 'Ready');
+		assert.equal(h.orca.statusWrites.at(-1)?.workspaceStatus, 'ready');
+		assert.match(h.app.board.backstoryFor(card.id).comments.at(-1)?.body ?? '', /wrong return type/);
+	} finally {
+		await h.stop();
+	}
+});
+
+test('a plain comment is stored without moving the card', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = h.app.board.createCard({ title: 'x', state: 'Review' });
+
+		assert.equal((await h.call<unknown>(`/api/cards/${card.id}/comments`, 'POST', { body: 'a question' })).status, 201);
+		assert.equal((await h.call<ErrorResponse>(`/api/cards/${card.id}/comments`, 'POST', { body: '' })).status, 400);
+		assert.equal(h.app.board.getCard(card.id)?.state, 'Review', 'commenting is not a verdict');
+	} finally {
+		await h.stop();
+	}
+});
+
+test('a card that never ran reports no diff instead of failing', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = h.app.board.createCard({ title: 'never ran' });
+
+		const res = await h.call<DiffResponse>(`/api/cards/${card.id}/diff`);
+		assert.equal(res.status, 200);
+		assert.equal(res.json.diff, null);
+		assert.match(String(res.json.reason), /no worktree/);
+	} finally {
+		await h.stop();
+	}
+});
+
+test('opening a card asks Orca to show its changed files as diffs', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = withWorktree(h.app, h.app.board.createCard({ title: 'x', state: 'Review' }));
+
+		const res = await h.call<OpenResponse>(`/api/cards/${card.id}/open`, 'POST', { target: 'changes' });
+		assert.equal(res.json.opened, 'changes');
+		assert.ok(
+			h.orca.calls.includes('fileOpenChanged:id:repo::/tmp/wt:diff'),
+			`expected a diff-mode open, got: ${h.orca.calls.join(', ')}`,
+		);
+	} finally {
+		await h.stop();
+	}
+});
+
+test('opening the session switches Orca to that terminal, and 400s when there is none', async () => {
+	const h = await mirrorHarness();
+	try {
+		const withSession = withWorktree(h.app, h.app.board.createCard({ title: 'has one', state: 'Review' }));
+		await h.call<OpenResponse>(`/api/cards/${withSession.id}/open`, 'POST', { target: 'session' });
+		assert.ok(h.orca.calls.includes('terminalSwitch:term_mirror'));
+
+		const without = h.app.board.createCard({ title: 'no session' });
+		const res = await h.call<ErrorResponse>(`/api/cards/${without.id}/open`, 'POST', { target: 'session' });
+		assert.equal(res.status, 400);
+	} finally {
+		await h.stop();
+	}
+});

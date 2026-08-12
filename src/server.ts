@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gitReviewDiff } from './git.ts';
 import type { App } from './app.ts';
 import { isCardState, type Card, type CardInput, type CardState } from './types.ts';
 
@@ -180,6 +181,70 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 
 		if (action === '/runs' && method === 'GET') {
 			send(res, 200, { runs: app.board.runsForCard(id) });
+			return;
+		}
+
+		if (action === '/approve' && method === 'POST') {
+			const body = await readBody(req);
+			const state = body['state'];
+			const approved = app.board.approveCard(id, {
+				...(str(body['comment']) ? { comment: String(body['comment']) } : {}),
+				...(isCardState(state) ? { state } : {}),
+			});
+			if (approved) await app.mirrorCard(approved, 'approved by review');
+			send(res, 200, { card: approved });
+			return;
+		}
+
+		if (action === '/reject' && method === 'POST') {
+			const body = await readBody(req);
+			const comment = str(body['comment'])?.trim();
+			// The reason is the whole point: it is what the next agent reads.
+			if (!comment) return send(res, 400, { error: 'comment is required — it is what the next agent reads' });
+			const rejected = app.board.rejectCard(id, comment);
+			if (rejected) await app.mirrorCard(rejected, 'changes requested');
+			send(res, 200, { card: rejected });
+			return;
+		}
+
+		if (action === '/comments' && method === 'GET') {
+			send(res, 200, { comments: app.board.commentsForCard(id) });
+			return;
+		}
+
+		if (action === '/comments' && method === 'POST') {
+			const body = await readBody(req);
+			const text = str(body['body'])?.trim();
+			if (!text) return send(res, 400, { error: 'body is required' });
+			send(res, 201, { comment: app.board.addComment(id, text) });
+			return;
+		}
+
+		if (action === '/diff' && method === 'GET') {
+			if (!card.worktreePath) return send(res, 200, { diff: null, reason: 'this card has no worktree yet' });
+			const diff = await gitReviewDiff(card.worktreePath, { baseRef: app.config.baseBranch });
+			send(res, 200, { diff });
+			return;
+		}
+
+		if (action === '/open' && method === 'POST') {
+			const body = await readBody(req);
+			const target = str(body['target']) ?? 'changes';
+
+			try {
+				if (target === 'session') {
+					if (!card.sessionId) return send(res, 400, { error: 'this card has no Orca session' });
+					await app.orca.terminalSwitch(card.sessionId);
+				} else {
+					if (!card.worktreePath) return send(res, 400, { error: 'this card has no worktree yet' });
+					const selector = card.worktreeId ? `id:${card.worktreeId}` : `path:${card.worktreePath}`;
+					await app.orca.fileOpenChanged({ worktreeSelector: selector, mode: 'diff' });
+				}
+			} catch (err) {
+				return send(res, 502, { error: `Orca refused: ${(err as Error).message}` });
+			}
+
+			send(res, 200, { opened: target });
 			return;
 		}
 

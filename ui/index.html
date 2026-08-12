@@ -38,6 +38,14 @@
 			button:hover { border-color: #3a3a44; }
 			button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
 			button.danger { color: var(--bad); }
+			button.ok { color: var(--ok); }
+			button:disabled { opacity: .45; cursor: not-allowed; }
+			.review { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 6px; }
+			.trail div { border-bottom: 1px solid var(--border); padding: 5px 0; font-size: 11px; }
+			.trail .k { font-weight: 600; }
+			.trail .k.rejected { color: var(--bad); }
+			.trail .k.approved { color: var(--ok); }
+			details summary { cursor: pointer; color: var(--muted); font-size: 11px; margin: 8px 0 4px; }
 			.status { margin-left: auto; display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 12px; }
 			.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
 			.board { display: grid; grid-template-columns: repeat(6, minmax(190px, 1fr)); gap: 10px; padding: 12px; align-items: start; }
@@ -85,8 +93,7 @@
 	<body>
 		<header>
 			<h1>Orca Kanban</h1>
-			<button class="primary" id="start">Start auto-run</button>
-			<button id="pause">Pause</button>
+			<button class="primary" id="autorun">Start auto-run</button>
 			<button id="after">Stop after current</button>
 			<button id="stopcur" class="danger">Stop current card</button>
 			<button id="once">Run one card</button>
@@ -128,6 +135,10 @@
 
 			const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 
+			// The panel re-renders on every poll, so a fetched diff is cached here or it
+			// would vanish a second after you asked for it.
+			let diffCache = { cardId: null, text: '' };
+
 			function render() {
 				const s = snapshot.scheduler || {};
 				const running = s.runState === 'running';
@@ -138,6 +149,15 @@
 					? `card ${s.currentCardId}${s.currentSessionId ? ' · ' + s.currentSessionId.slice(0, 18) : ''}`
 					: '';
 				document.getElementById('scount').textContent = `${s.cardsExecuted ?? 0} executed`;
+
+				// The button must say what it will DO, based on what the scheduler is
+				// actually doing right now — a static label lies after the first click.
+				const toggle = document.getElementById('autorun');
+				toggle.textContent = s.autoRun ? 'Pause auto-run' : 'Start auto-run';
+				toggle.className = s.autoRun ? '' : 'primary';
+				toggle.title = s.autoRun
+					? 'Auto-run is on: eligible cards are picked up automatically'
+					: 'Auto-run is off: nothing runs until you start it';
 
 				const board = document.getElementById('board');
 				board.innerHTML = '';
@@ -190,7 +210,9 @@
 				const panel = document.getElementById('panel');
 				panel.classList.remove('hidden');
 				let runs = [];
+				let comments = [];
 				try { runs = (await api(`/api/cards/${encodeURIComponent(c.id)}/runs`)).runs; } catch {}
+				try { comments = (await api(`/api/cards/${encodeURIComponent(c.id)}/comments`)).comments; } catch {}
 
 				document.getElementById('panelBody').innerHTML = `
 					<h2 style="font-size:13px;margin:0 0 2px">${esc(c.title)}</h2>
@@ -218,6 +240,30 @@
 						<button class="primary" onclick="saveCard()">Save</button>
 						<button onclick="retryCard()">Retry</button>
 						<button class="danger" onclick="deleteCard()">Delete</button>
+					</div>
+
+					<div class="review">
+						<label>Review — what the agent produced</label>
+						<div class="row">
+							<button ${c.worktreePath ? '' : 'disabled'} onclick="openInOrca('changes')">Open changes in Orca</button>
+							<button ${c.sessionId ? '' : 'disabled'} onclick="openInOrca('session')">Open session</button>
+						</div>
+						${c.worktreePath ? `<button style="margin-top:6px" onclick="loadDiff()">${diffCache.cardId === c.id ? 'Reload' : 'Show'} changes here</button>` : '<div class="hint">No worktree yet — this card has not run.</div>'}
+						${diffCache.cardId === c.id ? `<pre style="max-height:320px;color:var(--text)">${esc(diffCache.text)}</pre>` : ''}
+
+						<label>Comment / reason</label>
+						<textarea id="f-comment" placeholder="What must change, or why this is good"></textarea>
+						<div class="row">
+							<button class="ok" onclick="approveCard()">Approve → Done</button>
+							<button class="danger" onclick="rejectCard()">Request changes → Ready</button>
+						</div>
+						<button style="margin-top:6px" onclick="addComment()">Comment only</button>
+						<div class="hint">A rejection reason is sent to the next agent that picks this card up.</div>
+
+						<label>Review trail (${comments.length})</label>
+						<div class="trail">${
+							comments.map((m) => `<div><span class="k ${esc(m.kind)}">${esc(m.kind === 'comment' ? 'note' : m.kind)}</span> · ${esc(m.author)} · ${new Date(m.createdAt).toLocaleString()}<br>${esc(m.body)}</div>`).join('') || '<div class="hint">no comments yet</div>'
+						}</div>
 					</div>
 
 					${c.worktreePath ? `<label>Worktree</label><pre>${esc(c.worktreePath)}\n${esc(c.branch ?? '')}\n${esc(c.worktreeId ?? '')}</pre>` : ''}
@@ -266,6 +312,55 @@
 				await refresh();
 			}
 
+			const commentText = () => (document.getElementById('f-comment')?.value ?? '').trim();
+
+			async function approveCard() {
+				const body = commentText();
+				await api(`/api/cards/${encodeURIComponent(selectedId)}/approve`, 'POST', body ? { comment: body } : {});
+				editing = false;
+				await refresh();
+			}
+
+			async function rejectCard() {
+				const body = commentText();
+				if (!body) return alert('Say what needs to change — the next agent reads this.');
+				await api(`/api/cards/${encodeURIComponent(selectedId)}/reject`, 'POST', { comment: body });
+				editing = false;
+				await refresh();
+			}
+
+			async function addComment() {
+				const body = commentText();
+				if (!body) return alert('Nothing to say yet.');
+				await api(`/api/cards/${encodeURIComponent(selectedId)}/comments`, 'POST', { body });
+				editing = false;
+				await refresh();
+			}
+
+			async function loadDiff() {
+				const id = selectedId;
+				try {
+					const { diff, reason } = await api(`/api/cards/${encodeURIComponent(id)}/diff`);
+					if (!diff) {
+						diffCache = { cardId: id, text: reason || 'no diff available' };
+					} else {
+						const header = `vs ${diff.baseRef || 'HEAD'}${diff.untracked.length ? ` · ${diff.untracked.length} new file(s)` : ''}\n\n`;
+						diffCache = { cardId: id, text: header + (diff.stat ? diff.stat + '\n\n' : '') + (diff.patch || 'no changes') };
+					}
+				} catch (e) {
+					diffCache = { cardId: id, text: `could not read the diff: ${e.message}` };
+				}
+				renderPanel();
+			}
+
+			async function openInOrca(target) {
+				try {
+					await api(`/api/cards/${encodeURIComponent(selectedId)}/open`, 'POST', { target });
+				} catch (e) {
+					alert(e.message);
+				}
+			}
+
 			async function deleteCard() {
 				if (!confirm('Delete this card?')) return;
 				await api(`/api/cards/${encodeURIComponent(selectedId)}`, 'DELETE');
@@ -287,8 +382,16 @@
 					await refresh();
 				};
 			};
-			ctl('start', '/api/scheduler/start');
-			ctl('pause', '/api/scheduler/pause');
+			// One button, two endpoints: whichever the current state makes meaningful.
+			document.getElementById('autorun').onclick = async () => {
+				const on = (snapshot.scheduler || {}).autoRun;
+				try {
+					await api(on ? '/api/scheduler/pause' : '/api/scheduler/start', 'POST', {});
+				} catch (e) {
+					alert(e.message);
+				}
+				await refresh();
+			};
 			ctl('after', '/api/scheduler/stop-after-current');
 			ctl('stopcur', '/api/scheduler/stop-current');
 			ctl('once', '/api/scheduler/run-once');

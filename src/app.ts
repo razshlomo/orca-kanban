@@ -57,6 +57,7 @@ export function createApp(
 		config,
 		orchestration,
 		lookupCard: (id) => board.getCard(id),
+		lookupBackstory: (id) => board.backstoryFor(id),
 	});
 
 	const mirror = async (card: Card, state: CardState, comment?: string): Promise<void> => {

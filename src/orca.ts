@@ -138,6 +138,12 @@ export type OrcaApi = {
 	terminalShow(handle: string): Promise<OrcaTerminal | null>;
 	terminalList(): Promise<OrcaTerminal[]>;
 	terminalClose(options: { handle: string; tab?: boolean }): Promise<void>;
+	/** Brings a live agent session's tab to the front in the Orca UI. */
+	terminalSwitch(handle: string): Promise<void>;
+	/** Opens every git-changed file of a worktree in Orca — the review view. */
+	fileOpenChanged(options: { worktreeSelector: string; mode?: 'edit' | 'diff' | 'both' }): Promise<void>;
+	/** Opens one file in Orca's editor. */
+	fileOpen(options: { path: string; worktreeSelector?: string }): Promise<void>;
 };
 
 export class OrcaCliError extends Error {
@@ -513,6 +519,26 @@ export class OrcaCli implements OrcaApi {
 	async terminalClose(options: { handle: string; tab?: boolean }): Promise<void> {
 		const args = ['terminal', 'close', '--terminal', options.handle];
 		if (options.tab !== false) args.push('--tab');
+		await this.exec(args, { timeoutMs: 60_000, allowErrorCodes: ['selector_not_found', 'not_found'] });
+	}
+
+	async terminalSwitch(handle: string): Promise<void> {
+		await this.exec(['terminal', 'switch', '--terminal', handle], {
+			timeoutMs: 30_000,
+			allowErrorCodes: ['selector_not_found', 'not_found'],
+		});
+	}
+
+	async fileOpenChanged(options: { worktreeSelector: string; mode?: 'edit' | 'diff' | 'both' }): Promise<void> {
+		await this.exec(
+			['file', 'open-changed', '--mode', options.mode ?? 'diff', '--worktree', options.worktreeSelector],
+			{ timeoutMs: 60_000, allowErrorCodes: ['selector_not_found', 'not_found'] },
+		);
+	}
+
+	async fileOpen(options: { path: string; worktreeSelector?: string }): Promise<void> {
+		const args = ['file', 'open', options.path];
+		if (options.worktreeSelector) args.push('--worktree', options.worktreeSelector);
 		await this.exec(args, { timeoutMs: 60_000, allowErrorCodes: ['selector_not_found', 'not_found'] });
 	}
 }

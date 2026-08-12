@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createApp } from './app.ts';
+import { gitReviewDiff } from './git.ts';
 import { assertBoardWritable, CardWorkerGuardError } from './guard.ts';
 import { createHttpServer } from './server.ts';
 import { isCardState, type CardInput, type CardState } from './types.ts';
@@ -15,6 +16,11 @@ Usage:
   orca-kanban card move <id> <state>             Move a card between columns
   orca-kanban card rm <id>                       Delete a card
   orca-kanban card retry <id>                    Return a failed/blocked card to Ready
+  orca-kanban card approve <id> [-m <text>]      Accept the work; card lands in Done
+  orca-kanban card reject <id> -m <text>         Send it back to Ready with the reason
+  orca-kanban card comment <id> <text>           Add a note to the card's review trail
+  orca-kanban card diff <id>                     Show the card's changes, untracked included
+  orca-kanban card open <id> [--session]         Open the changes (or session) in Orca
   orca-kanban recover                            Reconcile cards stranded In Progress
   orca-kanban status                             Show board + scheduler status
   orca-kanban doctor                             Check Orca connectivity and config
@@ -236,6 +242,75 @@ async function main(): Promise<number> {
 				if (!card) throw new Error(`no such card ${id}`);
 				await app.mirrorCard(card, 'retry requested');
 				process.stdout.write(`${card.id} -> ${card.state} (attempts reset)\n`);
+				return 0;
+			}
+
+			if (sub === 'approve') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+				const comment = flagStr(args, 'm') ?? flagStr(args, 'comment');
+				const card = app.board.approveCard(id, comment !== undefined ? { comment } : {});
+				if (!card) throw new Error(`no such card ${id}`);
+				await app.mirrorCard(card, 'approved by review');
+				process.stdout.write(`${card.id} -> ${card.state} (approved)\n`);
+				return 0;
+			}
+
+			if (sub === 'reject') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+				const reason = flagStr(args, 'm') ?? flagStr(args, 'comment') ?? args._.slice(3).join(' ');
+				if (!reason.trim()) throw new Error('a reason is required: -m "what needs to change"');
+				const card = app.board.rejectCard(id, reason);
+				if (!card) throw new Error(`no such card ${id}`);
+				await app.mirrorCard(card, 'changes requested');
+				process.stdout.write(`${card.id} -> ${card.state} (changes requested; the next agent will read your reason)\n`);
+				return 0;
+			}
+
+			if (sub === 'comment') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+				const text = flagStr(args, 'm') ?? args._.slice(3).join(' ');
+				if (!text.trim()) throw new Error('nothing to say: pass the text or -m "…"');
+				const comment = app.board.addComment(id, text);
+				if (!comment) throw new Error(`no such card ${id}`);
+				process.stdout.write(`${comment.id} added to ${id}\n`);
+				return 0;
+			}
+
+			if (sub === 'diff') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+				const card = app.board.getCard(id);
+				if (!card) throw new Error(`no such card ${id}`);
+				if (!card.worktreePath) throw new Error(`${id} has no worktree yet — it has not run`);
+
+				const diff = await gitReviewDiff(card.worktreePath, { baseRef: app.config.baseBranch });
+				process.stdout.write(`# ${card.id} — ${card.title}\n# worktree: ${card.worktreePath}\n`);
+				process.stdout.write(`# vs ${diff.baseRef ?? 'HEAD'}${diff.untracked.length ? ` · ${diff.untracked.length} new file(s)` : ''}\n\n`);
+				process.stdout.write(diff.stat ? `${diff.stat}\n\n` : '');
+				process.stdout.write(diff.patch ? `${diff.patch}\n` : 'no changes\n');
+				return 0;
+			}
+
+			if (sub === 'open') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+				const card = app.board.getCard(id);
+				if (!card) throw new Error(`no such card ${id}`);
+
+				if (args.flags['session']) {
+					if (!card.sessionId) throw new Error(`${id} has no Orca session`);
+					await app.orca.terminalSwitch(card.sessionId);
+					process.stdout.write(`switched Orca to ${card.sessionId}\n`);
+					return 0;
+				}
+
+				if (!card.worktreePath) throw new Error(`${id} has no worktree yet — it has not run`);
+				const selector = card.worktreeId ? `id:${card.worktreeId}` : `path:${card.worktreePath}`;
+				await app.orca.fileOpenChanged({ worktreeSelector: selector, mode: 'diff' });
+				process.stdout.write(`opened this card's changed files in Orca\n`);
 				return 0;
 			}
 

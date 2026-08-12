@@ -94,6 +94,21 @@ const MIGRATIONS: string[] = [
 
 	INSERT INTO scheduler_state (id) VALUES (1);
 	`,
+	// v2 — append-only review trail: reviewer comments and approve/reject verdicts.
+	`
+	CREATE TABLE card_comments (
+		id         TEXT PRIMARY KEY,
+		card_id    TEXT NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+		/* 'comment' is a plain note; 'approved' and 'rejected' are review verdicts. */
+		kind       TEXT NOT NULL DEFAULT 'comment',
+		author     TEXT NOT NULL DEFAULT 'human',
+		body       TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		CHECK (kind IN ('comment','approved','rejected'))
+	);
+
+	CREATE INDEX idx_comments_card ON card_comments (card_id, created_at ASC);
+	`,
 ];
 
 /**

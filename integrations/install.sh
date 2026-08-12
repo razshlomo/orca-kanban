@@ -4,8 +4,8 @@
 #   2. the skill where omp and Claude Code both look for it (~/.claude/skills)
 #   3. a pointer block in the global AGENTS.md files that codex and cursor read
 #
-# Idempotent: re-running updates the skill and leaves the AGENTS.md blocks alone
-# if they are already present.
+# Idempotent: re-running refreshes the skill and rewrites the AGENTS.md block in
+# place, so an updated block reaches agents that were set up earlier.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -40,13 +40,30 @@ cp "$SKILL_SRC" "$SKILL_DIR/SKILL.md"
 say "skill (omp + Claude Code)" "$SKILL_DIR/SKILL.md"
 
 # ------------------------------------------- 3. AGENTS.md pointer (codex, cursor)
+# Rewrites the delimited block in place, leaving everything else in the file alone.
+# Skipping when the markers exist would strand old text on machines set up earlier.
 add_block() {
 	local target="$1"
+	mkdir -p "$(dirname "$target")"
+
 	if [ -f "$target" ] && grep -q 'BEGIN orca-kanban' "$target"; then
-		say "AGENTS.md block (already present)" "$target"
+		if grep -q 'END orca-kanban' "$target"; then
+			local tmp
+			tmp="$(mktemp)"
+			# Copy everything outside the markers, then drop our block back in its place.
+			awk -v block="$BLOCK_SRC" '
+				/BEGIN orca-kanban/ { inside = 1; while ((getline line < block) > 0) print line; close(block); next }
+				/END orca-kanban/   { inside = 0; next }
+				!inside             { print }
+			' "$target" > "$tmp"
+			mv "$tmp" "$target"
+			say "AGENTS.md block refreshed" "$target"
+		else
+			say "AGENTS.md block LEFT ALONE (no END marker)" "$target"
+		fi
 		return
 	fi
-	mkdir -p "$(dirname "$target")"
+
 	[ -f "$target" ] && printf '\n' >> "$target"
 	cat "$BLOCK_SRC" >> "$target"
 	say "AGENTS.md block added" "$target"

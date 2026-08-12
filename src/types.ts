@@ -98,6 +98,32 @@ export type CardRun = {
   details: string | null;
 };
 
+/** One entry in a card's append-only review trail. */
+export type CardComment = {
+	id: string;
+	cardId: string;
+	/** `comment` is a plain note; `approved` and `rejected` are review verdicts. */
+	kind: 'comment' | 'approved' | 'rejected';
+	author: string;
+	body: string;
+	createdAt: number;
+};
+
+/**
+ * Everything a fresh agent needs to know about what already happened on its card:
+ * the reviewer's words, and how the last attempt ended. Without this a rejected
+ * card re-runs blind and repeats the mistake that got it sent back.
+ */
+export type CardBackstory = {
+	comments: CardComment[];
+	previousAttempt: {
+		attempt: number;
+		status: string;
+		summary: string | null;
+		error: string | null;
+	} | null;
+};
+
 /** What the agent wrote to its result file, if anything. */
 export type AgentResultFile = {
   status: AgentStatus;

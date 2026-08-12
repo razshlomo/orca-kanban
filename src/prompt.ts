@@ -1,4 +1,4 @@
-import type { Card } from './types.ts';
+import type { Card, CardBackstory } from './types.ts';
 
 export type PromptContext = {
 	/** Where the agent must write its machine-readable outcome, relative to the worktree. */
@@ -7,7 +7,44 @@ export type PromptContext = {
 	dependencyLines: string[];
 	branch: string | null;
 	worktreePath: string | null;
+	/** Reviewer comments and the previous attempt, when the card has been round the loop. */
+	backstory?: CardBackstory;
 };
+
+/**
+ * Renders what already happened on this card.
+ *
+ * A rejected card gets a fresh agent with no memory, so the reviewer's reason has
+ * to travel in the prompt or it is lost and the same mistake comes back.
+ */
+function backstorySection(backstory: CardBackstory | undefined): string {
+	if (!backstory) return '';
+
+	const parts: string[] = [];
+	const previous = backstory.previousAttempt;
+
+	if (previous) {
+		const lines = [`Attempt ${previous.attempt} ended as ${previous.status}.`];
+		if (previous.summary) lines.push(`What that attempt reported:\n${previous.summary}`);
+		if (previous.error) lines.push(`How it failed:\n${previous.error}`);
+		parts.push(`Previous attempt on this card:\n\n${lines.join('\n\n')}`);
+	}
+
+	if (backstory.comments.length > 0) {
+		const trail = backstory.comments
+			.map((c) => {
+				const label = c.kind === 'rejected' ? 'CHANGES REQUESTED' : c.kind === 'approved' ? 'APPROVED' : 'COMMENT';
+				return `* [${label}] ${c.author}: ${c.body}`;
+			})
+			.join('\n');
+		parts.push(
+			`Review history, oldest first. The most recent CHANGES REQUESTED is why this card\n` +
+				`came back to you — address it specifically:\n\n${trail}`,
+		);
+	}
+
+	return parts.length > 0 ? `\n${parts.join('\n\n')}\n` : '';
+}
 
 /**
  * Renders the single-card execution prompt.
@@ -38,7 +75,7 @@ ${acceptance}
 
 Dependencies:
 ${dependencies}
-
+${backstorySection(ctx.backstory)}
 Instructions:
 
 * Work only on this card.

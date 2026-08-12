@@ -9,7 +9,7 @@ import { slugify } from './text.ts';
 import type { Logger } from './logger.ts';
 import type { OrcaApi, OrcaWorktreeStatus } from './orca.ts';
 import type { OrchestrationApi } from './orchestration.ts';
-import type { AgentResultFile, AgentStatus, Card, ExecutionResult, KanbanConfig } from './types.ts';
+import type { AgentResultFile, AgentStatus, Card, CardBackstory, ExecutionResult, KanbanConfig } from './types.ts';
 import { isAgentStatus } from './types.ts';
 
 export type ResumeTarget = {
@@ -114,6 +114,8 @@ export type OrcaExecutorDeps = {
 	orca: OrcaApi;
 	config: KanbanConfig;
 	lookupCard: (id: string) => Card | null;
+	/** Reviewer comments and the last attempt, so a card sent back knows why. */
+	lookupBackstory?: (id: string) => CardBackstory;
 	orchestration: OrchestrationApi;
 };
 
@@ -137,7 +139,7 @@ type CompletionOutcome = {
  *    result file, because Orca reports liveness, not verdicts.
  */
 export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
-	const { orca, config, lookupCard, orchestration } = deps;
+	const { orca, config, lookupCard, lookupBackstory, orchestration } = deps;
 
 	return async function executeOneCard(card: Card, ctx: ExecuteContext): Promise<ExecutionResult> {
 		const startedAt = Date.now();
@@ -199,6 +201,7 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 					dependencyLines: dependencyLines(card, lookupCard),
 					branch: null,
 					worktreePath: null,
+					...(lookupBackstory ? { backstory: lookupBackstory(card.id) } : {}),
 				});
 
 				const name = `kanban-${slugify(card.title, 28)}-${card.id.replace(/^card_/, '')}`;
