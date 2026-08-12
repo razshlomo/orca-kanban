@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createApp } from './app.ts';
-import { BoardRuleError } from './board.ts';
+import { BoardRuleError, schedulerLiveness } from './board.ts';
 import { gitReviewDiff } from './git.ts';
 import { describeLanding, landCardWork } from './land.ts';
 import { formatRelative, parseDueAt, parseDuration } from './text.ts';
@@ -11,8 +11,9 @@ import { isCardState, type CardInput, type CardState } from './types.ts';
 const USAGE = `orca-kanban — Kanban-driven sequential agent execution for Orca
 
 Usage:
-  orca-kanban serve [--port <n>] [--auto-run]    Start the board API + UI (and the scheduler)
-  orca-kanban run [--once]                       Run the scheduler loop in the foreground
+  orca-kanban serve [--port <n>] [--auto-run] [--max-concurrent <n>]
+                                                 Start the board API + UI (and the scheduler)
+  orca-kanban run [--once] [--max-concurrent <n>] Run the scheduler loop in the foreground
   orca-kanban card add <title> [options]         Create a card
   orca-kanban card list [--state <state>]        List cards
   orca-kanban card show <id>                     Show one card and its run history
@@ -93,6 +94,9 @@ async function main(): Promise<number> {
 			config: {
 				...(flagNum(args, 'port') === undefined ? {} : { port: flagNum(args, 'port') as number }),
 				...(args.flags['auto-run'] ? { autoRun: true } : {}),
+				...(flagNum(args, 'max-concurrent') === undefined
+					? {}
+					: { maxConcurrent: flagNum(args, 'max-concurrent') as number }),
 			},
 		});
 
@@ -138,7 +142,12 @@ async function main(): Promise<number> {
 
 	// -------------------------------------------------------------------- run
 	if (command === 'run') {
-		const app = createApp();
+		const app = createApp({
+			config:
+				flagNum(args, 'max-concurrent') === undefined
+					? {}
+					: { maxConcurrent: flagNum(args, 'max-concurrent') as number },
+		});
 		await app.recover();
 
 		if (args.flags['once']) {
@@ -225,9 +234,13 @@ async function main(): Promise<number> {
 				const eligible = new Set(app.board.eligibleCards().map((c) => c.id));
 				if (cards.length === 0) process.stdout.write('(no cards)\n');
 				for (const c of cards) {
+					// The reason matters more than the mark: a Ready card sitting still is
+					// either due later, out of retries, or waiting on somebody else.
+					const why = eligible.has(c.id) ? '' : (app.board.whyNotRunnable(c) ?? '');
 					process.stdout.write(
 						`${c.id}  ${c.state.padEnd(11)} P${String(c.priority).padEnd(4)} ` +
-							`${eligible.has(c.id) ? '✓' : ' '} ${c.attemptCount}/${c.maxAttempts}  ${c.title}\n`,
+							`${eligible.has(c.id) ? '✓' : ' '} ${c.attemptCount}/${c.maxAttempts}  ${c.title}` +
+							`${why === '' ? '' : `  (${why})`}\n`,
 					);
 				}
 				return 0;
@@ -396,7 +409,13 @@ async function main(): Promise<number> {
 		for (const c of cards) byState.set(c.state, (byState.get(c.state) ?? 0) + 1);
 
 		const inFlight = app.board.inFlightCount();
-		process.stdout.write(`scheduler: ${s.runState}${s.autoRun ? ' (auto-run on)' : ' (auto-run off)'}\n`);
+		// The row survives the process, so say plainly when nothing is watching the board.
+		const live = schedulerLiveness(s, app.config.pollIntervalMs);
+		process.stdout.write(
+			live.alive
+				? `scheduler: ${s.runState}${s.autoRun ? ' (auto-run on)' : ' (auto-run off)'} · ${live.reason}\n`
+				: `scheduler: not running (${live.reason}) · start it with: kanban serve\n`,
+		);
 		process.stdout.write(`slots:     ${inFlight}/${app.config.maxConcurrent} in flight\n`);
 		for (const flight of s.inFlight) {
 			process.stdout.write(`  running: ${flight.cardId} · session ${flight.sessionId ?? '—'}\n`);

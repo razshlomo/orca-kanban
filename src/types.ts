@@ -281,6 +281,13 @@ export type SchedulerStatus = {
   lastCardFinishedAt: number | null;
   cardsExecuted: number;
   stopAfterCurrent: boolean;
+  /**
+   * Last time the owning scheduler process said it was alive, and its pid. The row
+   * can outlive the process that wrote it (a `run` that exited, a crash), so these
+   * are what separate "waiting for work" from "nothing is running at all".
+   */
+  heartbeatAt: number | null;
+  ownerPid: number | null;
 };
 
 export type BoardEvent =

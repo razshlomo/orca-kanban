@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import test from 'node:test';
 import { Board } from '../src/board.ts';
+import { loadConfig } from '../src/config.ts';
 import { openDb } from '../src/db.ts';
 import { Scheduler } from '../src/scheduler.ts';
 import type { Card, ExecutionResult } from '../src/types.ts';
@@ -226,4 +227,15 @@ test('a scheduler at its ceiling stays idle instead of spinning', async () => {
 	await scheduler.stop();
 	other.close();
 	board.close();
+});
+
+test('the slot ceiling can be raised for one run without editing config', () => {
+	// The flag is documented, so it must reach the config the claim guard reads.
+	assert.equal(loadConfig({ maxConcurrent: 4 }).maxConcurrent, 4);
+	assert.equal(loadConfig({}).maxConcurrent, 1, 'and one slot stays the default');
+
+	// A nonsense value is refused rather than silently clamped: 0 slots would
+	// deadlock the board with no explanation.
+	assert.throws(() => loadConfig({ maxConcurrent: 0 }), /must be >= 1/);
+	assert.throws(() => loadConfig({ maxConcurrent: 2.5 }), /whole number of slots/);
 });

@@ -258,6 +258,54 @@ with its work already complete.
 
 ---
 
+## Which column starts automatically
+
+Only **Ready**. This is the one rule to keep in mind:
+
+| Column | Picked up by auto-run? |
+| --- | --- |
+| Backlog | **never** — it is the parking column |
+| Ready | yes, as soon as it is eligible |
+| In Progress / Review / Done / Blocked | no |
+
+So a **scheduled card belongs in Ready, not Backlog**. A date on a Backlog card does
+nothing: the card stays parked even when the date has passed, because eligibility
+requires `Ready`. That is deliberate — parking a card must mean it cannot start.
+
+`kanban card snooze` therefore leaves the card in **Ready** and uses `notBefore` to
+hold it there. It wakes by itself when due, with nobody moving it between columns:
+
+```
+kanban card add "Weekly dependency audit" --state Ready --not-before 7d --every 1w
+```
+
+### Why a Ready card is sitting still
+
+A held card looks identical to a runnable one, so both `card list` and the UI now say
+the reason:
+
+```
+card_b0c4a533  Ready  P0     0/2  Weekly dependency audit  (due in 7d)
+card_38757046  Ready  P0     0/2  Ship the API             (waiting on card_0649d0b3)
+card_dc6bd0c8  Ready  P0     1/1  Flaky migration          (no retries left)
+```
+
+A `✓` marks a card that is genuinely runnable right now. `kanban status` also reports
+`next due`, which is when the loop will next wake up on its own.
+
+### "auto-run on" with nothing running
+
+The scheduler row is stored in SQLite, so it outlives the process that wrote it — a
+`kanban run` that exited, or a daemon that crashed, both used to leave `status`
+claiming *idle, auto-run on* while nothing was watching the board. It now checks the
+owning pid and its heartbeat:
+
+```
+scheduler: not running (scheduler process 73348 is gone) · start it with: kanban serve
+```
+
+The UI shows the same as a red **not running** pill.
+
 ## Reviewing a card
 
 With the default `successState: "Review"` a finished card **stops** and waits for a
@@ -370,6 +418,15 @@ time, board-wide:
 ```json
 { "maxConcurrent": 3 }
 ```
+
+That goes in **`~/.orca-kanban/config.json`** — create the file if it does not exist.
+Config is read once at startup, so restart the board afterwards:
+
+```
+omp hub restart kanban-board
+```
+
+For a single run instead of permanently: `kanban run --max-concurrent 3`.
 
 Two things enforce it, and the second is the one that matters:
 
@@ -561,7 +618,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 147 tests
+npm test          # 154 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```

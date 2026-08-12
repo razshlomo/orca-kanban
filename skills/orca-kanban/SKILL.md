@@ -155,6 +155,14 @@ Durations are `30m`, `2h`, `7d`, `1w`, or a date like `2026-08-19`. A held card
 stays in Ready and simply is not eligible until it is due, so nothing runs early.
 A card created with `--every` re-arms itself each time it reaches Done.
 
+**A schedule needs `--state Ready`.** A date on a Backlog card does nothing: Backlog
+is never picked up, so the card stays parked even after the date passes. Ready plus
+`--not-before` is what makes it wake by itself.
+
+`kanban card list` says why a Ready card is not running — `(due in 7d)`,
+`(waiting on card_x)`, `(no retries left)` — so check there before assuming a card
+is stuck.
+
 ## Review is the human's call, not yours
 
 A finished card stops in **Review**. `kanban card approve` and `kanban card reject`

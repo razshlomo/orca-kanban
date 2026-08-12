@@ -160,7 +160,9 @@ export class Scheduler extends EventEmitter {
 
 	private async loop(): Promise<void> {
 		while (this.running) {
-			this.board.patchSchedulerState({ heartbeatAt: Date.now() });
+			// The pid rides along with the heartbeat: whoever is actually looping owns the
+			// row, so a takeover after a crash is visible instead of a dead pid sticking.
+			this.board.patchSchedulerState({ heartbeatAt: Date.now(), ownerPid: process.pid });
 
 			if (!this.board.schedulerStatus().autoRun) {
 				this.board.patchSchedulerState({ runState: 'paused' });

@@ -164,9 +164,14 @@
 			function render() {
 				const s = snapshot.scheduler || {};
 				const running = s.runState === 'running';
-				const color = running ? 'var(--ok)' : s.autoRun ? 'var(--warn)' : 'var(--muted)';
-				document.getElementById('sstate').innerHTML =
-					`<span class="dot" style="background:${color}"></span>${esc(s.runState || '—')}${s.autoRun ? ' · auto' : ''}`;
+				// A row can outlive its process, so `runState` alone would keep claiming the
+				// board is watched after the daemon died. Say so instead of implying pickup.
+				const dead = s.live && s.live.alive === false;
+				const color = dead ? 'var(--bad)' : running ? 'var(--ok)' : s.autoRun ? 'var(--warn)' : 'var(--muted)';
+				document.getElementById('sstate').innerHTML = dead
+					? `<span class="dot" style="background:${color}"></span>not running`
+					: `<span class="dot" style="background:${color}"></span>${esc(s.runState || '—')}${s.autoRun ? ' · auto' : ''}`;
+				document.getElementById('sstate').title = dead ? `${s.live.reason} — start it with: kanban serve` : '';
 				document.getElementById('scount').textContent =
 					`${s.cardsExecuted ?? 0} executed · ${s.inFlightCount ?? 0}/${s.maxConcurrent ?? 1} slots`;
 
@@ -240,7 +245,7 @@
 						${c.dependencies.length ? `<span class="tag">deps ${c.dependencies.length}</span>` : ''}
 						${c.attemptCount ? `<span class="tag">try ${c.attemptCount}/${c.maxAttempts}</span>` : ''}
 						${eligible ? '<span class="tag" style="color:var(--ok)">eligible</span>' : ''}
-						${c.notBefore && c.notBefore > Date.now() ? `<span class="tag" style="color:var(--warn)">due ${rel(c.notBefore)}</span>` : ''}
+						${!eligible && c.heldBecause ? `<span class="tag" style="color:var(--warn)">${esc(c.heldBecause)}</span>` : ''}
 						${c.repeatEveryMs ? '<span class="tag">repeats</span>' : ''}
 						${c.lastResult ? `<span class="tag ${c.lastResult === 'DONE' ? '' : 'err'}">${esc(c.lastResult)}</span>` : ''}
 					</div>`;

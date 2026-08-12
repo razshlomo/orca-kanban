@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { immediateTransaction, openDb, type Db, type SqlValue } from './db.ts';
+import { formatRelative } from './text.ts';
 import type {
 	AgentStatus,
 	Card,
@@ -194,6 +195,25 @@ export class Board extends EventEmitter {
 	getNextEligibleCard(now = Date.now()): Card | null {
 		const row = this.db.prepare(`${ELIGIBLE_SQL} LIMIT 1`).get(now) as Row | undefined;
 		return row ? rowToCard(row) : null;
+	}
+
+	/**
+	 * Why a Ready card is not running right now, in a few words, or null when it is
+	 * runnable. The eligibility query answers yes/no; a person looking at a full
+	 * Ready column needs the reason, otherwise a held card is indistinguishable
+	 * from a stuck one.
+	 *
+	 * Cards outside Ready return null: their column already says why.
+	 */
+	whyNotRunnable(card: Card, now = Date.now()): string | null {
+		if (card.state !== 'Ready') return null;
+		if (card.claimedBy !== null) return 'claimed';
+		if (card.attemptCount >= card.maxAttempts) return 'no retries left';
+		if (card.notBefore !== null && card.notBefore > now) return `due ${formatRelative(card.notBefore)}`;
+
+		const waiting = card.dependencies.filter((id) => this.getCard(id)?.state !== 'Done');
+		if (waiting.length > 0) return `waiting on ${waiting.length === 1 ? waiting[0] : `${waiting.length} deps`}`;
+		return null;
 	}
 
 	/** How many cards are executing right now, board-wide across every worker. */
@@ -848,6 +868,8 @@ export class Board extends EventEmitter {
 			lastCardFinishedAt: row['last_card_finished_at'] === null ? null : Number(row['last_card_finished_at']),
 			cardsExecuted: Number(row['cards_executed'] ?? 0),
 			stopAfterCurrent: Number(row['stop_after_current']) === 1,
+			heartbeatAt: row['heartbeat_at'] === null ? null : Number(row['heartbeat_at']),
+			ownerPid: row['owner_pid'] === null ? null : Number(row['owner_pid']),
 		};
 	}
 
@@ -889,6 +911,38 @@ export class Board extends EventEmitter {
 
 		return this.schedulerStatus();
 	}
+}
+
+/**
+ * Whether a scheduler process is actually alive behind the `scheduler_state` row.
+ *
+ * The row is a persisted mirror, so it outlives whoever wrote it: a `run` that has
+ * exited, or a crashed daemon, both leave `autoRun` and `runState` looking healthy.
+ * Reporting that as "idle, auto-run on" tells somebody their cards will be picked up
+ * when in fact nothing is watching the board.
+ *
+ * The pid is the strong signal; the heartbeat covers a pid that has been recycled by
+ * the OS onto an unrelated process.
+ */
+export function schedulerLiveness(
+	status: SchedulerStatus,
+	pollIntervalMs: number,
+	now = Date.now(),
+): { alive: boolean; reason: string } {
+	if (status.ownerPid === null) return { alive: false, reason: 'no scheduler has ever run' };
+
+	try {
+		process.kill(status.ownerPid, 0);
+	} catch {
+		return { alive: false, reason: `scheduler process ${status.ownerPid} is gone` };
+	}
+
+	// Generous: a slow iteration must not be reported as a death.
+	const staleAfter = Math.max(pollIntervalMs * 3, 15_000);
+	if (status.heartbeatAt === null || now - status.heartbeatAt > staleAfter) {
+		return { alive: false, reason: `no heartbeat from pid ${status.ownerPid}` };
+	}
+	return { alive: true, reason: `pid ${status.ownerPid}` };
 }
 
 export type { AgentStatus };

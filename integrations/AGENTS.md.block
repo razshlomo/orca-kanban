@@ -12,6 +12,8 @@ board", "queue this", "break this into cards", or asks what is on the board, use
 - Read the board: `kanban card list`, `kanban card show <id>`, `kanban status`.
 - Run it: `kanban run --once` (one card) or `kanban serve` (board UI + auto-run).
 - Fix stuck work: `kanban card retry <id>`, `kanban card move <id> <state>`, `kanban recover`.
+- A schedule needs `--state Ready`: a date on a Backlog card never fires, because
+  Backlog is not picked up. `kanban card list` says why a Ready card waits.
 - Later or repeating work: `--not-before 7d` on add, `kanban card snooze <id> 1w`, or
   `--every 1w` for a recurring check. A held card is not eligible until it is due.
 

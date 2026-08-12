@@ -3,6 +3,8 @@ import test from 'node:test';
 import { formatRelative, parseDueAt, parseDuration } from '../src/text.ts';
 import { okResult, silentLogger, testBoard, testConfig } from './helpers.ts';
 import { Scheduler } from '../src/scheduler.ts';
+import { schedulerLiveness } from '../src/board.ts';
+import type { Card } from '../src/types.ts';
 
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
@@ -162,4 +164,121 @@ test('a due recurring card runs again and adds a second run to the same card', a
 	assert.equal(board.runsForCard(card.id).length, 2, 'two occurrences, one card, one history');
 	await scheduler.stop();
 	board.close();
+});
+
+test('a still Ready card explains itself, so a held card is not mistaken for a stuck one', () => {
+	const { board } = testBoard();
+	const now = Date.now();
+
+	const runnable = board.createCard({ title: 'runnable', state: 'Ready' });
+	assert.equal(board.whyNotRunnable(runnable), null, 'a runnable card has nothing to explain');
+
+	const held = board.createCard({ title: 'held', state: 'Ready', notBefore: now + 7 * 86_400_000 });
+	assert.match(board.whyNotRunnable(held) ?? '', /^due in 7d$/);
+
+	const spent = board.createCard({ title: 'spent', state: 'Ready', maxAttempts: 1 });
+	board.claimCard(spent.id, 'w');
+	board.moveCard(spent.id, 'Ready');
+	assert.equal(board.whyNotRunnable(board.getCard(spent.id) as Card), 'no retries left');
+
+	const blocker = board.createCard({ title: 'blocker', state: 'Backlog' });
+	const waiting = board.createCard({ title: 'waiting', state: 'Ready', dependencies: [blocker.id] });
+	assert.equal(board.whyNotRunnable(waiting), `waiting on ${blocker.id}`);
+	board.moveCard(blocker.id, 'Done');
+	assert.equal(board.whyNotRunnable(board.getCard(waiting.id) as Card), null, 'and clears when the dep lands');
+
+	const claimed = board.createCard({ title: 'claimed', state: 'Ready' });
+	board.claimCard(claimed.id, 'w');
+	// Claiming moves it to In Progress, whose column already explains the stillness.
+	assert.equal(board.whyNotRunnable(board.getCard(claimed.id) as Card), null);
+
+	board.close();
+});
+
+test('a Backlog card is never eligible, however due it is', () => {
+	const { board } = testBoard();
+	// The whole point of Backlog: parking a card there means it cannot start, and a
+	// date in the past must not change that.
+	const parked = board.createCard({ title: 'parked', state: 'Backlog', notBefore: Date.now() - 60_000 });
+
+	assert.equal(board.getNextEligibleCard(), null, 'nothing runs out of Backlog');
+	assert.equal(board.eligibleCards().length, 0);
+	assert.equal(board.nextWakeAt(), null, 'and it does not even schedule a wakeup');
+
+	board.moveCard(parked.id, 'Ready');
+	assert.equal(board.getNextEligibleCard()?.id, parked.id, 'moving it to Ready is what arms it');
+	board.close();
+});
+
+test('a card held in Ready wakes on its own, with no move needed', () => {
+	const { board } = testBoard();
+	const soon = Date.now() + 40;
+	const card = board.createCard({ title: 'wakes', state: 'Ready', notBefore: soon });
+
+	assert.equal(board.getNextEligibleCard(soon - 10), null, 'not yet');
+	assert.equal(board.nextWakeAt(soon - 10), soon, 'and the loop knows exactly when to look again');
+	assert.equal(board.getNextEligibleCard(soon + 1)?.id, card.id, 'due, with no human touching the column');
+	board.close();
+});
+
+test('a scheduler row that outlived its process is reported as not running', () => {
+	const { board } = testBoard();
+	const base = board.schedulerStatus();
+
+	assert.equal(schedulerLiveness(base, 2000).alive, false, 'a board nobody has run yet');
+	assert.match(schedulerLiveness(base, 2000).reason, /has ever run/);
+
+	// The exact trap: a finished `run` leaves autoRun on and the state looking healthy.
+	const stale = { ...base, autoRun: true, runState: 'idle' as const, ownerPid: 999_999, heartbeatAt: Date.now() };
+	assert.equal(schedulerLiveness(stale, 2000).alive, false, 'a dead pid is not idle, it is absent');
+	assert.match(schedulerLiveness(stale, 2000).reason, /999999 is gone/);
+
+	// A live pid with an old heartbeat: recycled pid, or a wedged loop.
+	const wedged = { ...base, ownerPid: process.pid, heartbeatAt: Date.now() - 60_000 };
+	assert.equal(schedulerLiveness(wedged, 2000).alive, false);
+	assert.match(schedulerLiveness(wedged, 2000).reason, /no heartbeat/);
+
+	const healthy = { ...base, ownerPid: process.pid, heartbeatAt: Date.now() };
+	assert.equal(schedulerLiveness(healthy, 2000).alive, true);
+	board.close();
+});
+
+test('a slow poll interval does not make a healthy scheduler look dead', () => {
+	const { board } = testBoard();
+	const slow = 30_000;
+	const status = { ...board.schedulerStatus(), ownerPid: process.pid, heartbeatAt: Date.now() - 45_000 };
+
+	// One missed beat at a 30s interval is still within tolerance (3 intervals).
+	assert.equal(schedulerLiveness(status, slow).alive, true, 'tolerance scales with the configured interval');
+	assert.equal(
+		schedulerLiveness({ ...status, heartbeatAt: Date.now() - 95_000 }, slow).alive,
+		false,
+		'but a long silence is still a death',
+	);
+	board.close();
+});
+
+test('the loop keeps the pid current, so a takeover is visible', async () => {
+	const { board } = testBoard();
+	const scheduler = new Scheduler({
+		board,
+		config: testConfig({ pollIntervalMs: 100 }),
+		executor: async (_card, ctx) => okResult(ctx.runId),
+		log: silentLogger,
+	});
+
+	// A crashed predecessor left its pid behind.
+	board.patchSchedulerState({ ownerPid: 999_999, heartbeatAt: Date.now() - 600_000 });
+	assert.equal(schedulerLiveness(board.schedulerStatus(), 100).alive, false);
+
+	scheduler.start({ autoRun: false });
+	try {
+		await new Promise((r) => setTimeout(r, 250));
+		const live = schedulerLiveness(board.schedulerStatus(), 100);
+		assert.equal(live.alive, true, 'the running loop claimed the row');
+		assert.equal(board.schedulerStatus().ownerPid, process.pid);
+	} finally {
+		await scheduler.stop();
+		board.close();
+	}
 });

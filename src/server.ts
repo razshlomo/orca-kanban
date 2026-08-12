@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { gitReviewDiff } from './git.ts';
 import { landCardWork } from './land.ts';
 import { parseDueAt } from './text.ts';
-import { BoardRuleError } from './board.ts';
+import { BoardRuleError, schedulerLiveness } from './board.ts';
 import type { App } from './app.ts';
 import { isCardState, type Card, type CardInput, type CardState } from './types.ts';
 
@@ -68,8 +68,10 @@ function cardInputFrom(body: Record<string, unknown>): Partial<CardInput> & { st
 
 /** Board + scheduler view the UI polls. */
 function stateSnapshot(app: App): Record<string, unknown> {
-	const cards = app.board.listCards();
 	const status = app.board.schedulerStatus();
+	// The reason a card sits still travels with the card, so the UI never has to
+	// re-derive the eligibility rules and drift from the board.
+	const cards = app.board.listCards().map((c) => ({ ...c, heldBecause: app.board.whyNotRunnable(c) }));
 
 	return {
 		cards,
@@ -80,6 +82,8 @@ function stateSnapshot(app: App): Record<string, unknown> {
 			maxConcurrent: app.config.maxConcurrent,
 			inFlightCount: app.board.inFlightCount(),
 			nextWakeAt: app.board.nextWakeAt(),
+			// The UI must not promise pickup when no process is watching the board.
+			live: schedulerLiveness(status, app.config.pollIntervalMs),
 		},
 		config: {
 			defaultAgent: app.config.defaultAgent,
