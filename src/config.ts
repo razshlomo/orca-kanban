@@ -44,6 +44,7 @@ export const DEFAULT_CONFIG: KanbanConfig = {
 	enabled: true,
 	autoRun: false,
 	pollIntervalMs: 2000,
+	maxConcurrent: 1,
 	defaultAgent: 'omp',
 	maxAttempts: 2,
 	successState: 'Review',
@@ -120,6 +121,8 @@ export function loadConfig(overrides: Partial<KanbanConfig> = {}): KanbanConfig 
 		);
 	}
 	if (merged.maxAttempts < 1) throw new Error('maxAttempts must be >= 1');
+	if (merged.maxConcurrent < 1) throw new Error('maxConcurrent must be >= 1');
+	if (!Number.isInteger(merged.maxConcurrent)) throw new Error('maxConcurrent must be a whole number of slots');
 	if (merged.pollIntervalMs < 100) throw new Error('pollIntervalMs must be >= 100');
 	if (merged.doneConfirmations < 1) throw new Error('doneConfirmations must be >= 1');
 

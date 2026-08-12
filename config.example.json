@@ -3,6 +3,8 @@
   "autoRun": false,
   "pollIntervalMs": 2000,
 
+  "maxConcurrent": 1,
+
   "defaultAgent": "omp",
   "defaultRepo": "/absolute/path/to/your/repo",
 

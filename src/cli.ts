@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createApp } from './app.ts';
 import { gitReviewDiff } from './git.ts';
+import { formatRelative, parseDueAt, parseDuration } from './text.ts';
 import { assertBoardWritable, CardWorkerGuardError } from './guard.ts';
 import { createHttpServer } from './server.ts';
 import { isCardState, type CardInput, type CardState } from './types.ts';
@@ -21,6 +22,7 @@ Usage:
   orca-kanban card comment <id> <text>           Add a note to the card's review trail
   orca-kanban card diff <id>                     Show the card's changes, untracked included
   orca-kanban card open <id> [--session]         Open the changes (or session) in Orca
+  orca-kanban card snooze <id> <7d|2026-08-19>   Defer a card until it is due
   orca-kanban recover                            Reconcile cards stranded In Progress
   orca-kanban status                             Show board + scheduler status
   orca-kanban doctor                             Check Orca connectivity and config
@@ -29,6 +31,7 @@ Card options:
   --description <text>   --acceptance <text>   --priority <n>
   --deps <id,id>         --repo <path|id:…>    --agent <name>
   --max-attempts <n>     --state <state>       --force (override card-worktree guard)
+  --not-before <7d|ISO>  hold until due        --every <1w>  re-run on that interval
 
 States: Backlog | Ready | "In Progress" | Review | Done | Blocked
 `;
@@ -188,8 +191,29 @@ async function main(): Promise<number> {
 				if (maxAttempts !== undefined) input.maxAttempts = maxAttempts;
 				if (state !== undefined) input.state = requireState(state);
 
+				const notBefore = flagStr(args, 'not-before');
+				if (notBefore !== undefined) {
+					const dueAt = parseDueAt(notBefore);
+					if (dueAt === null) throw new Error(`could not read --not-before "${notBefore}" — try 7d, 2h, or 2026-08-19`);
+					input.notBefore = dueAt;
+				}
+
+				const every = flagStr(args, 'every');
+				if (every !== undefined) {
+					const interval = parseDuration(every);
+					if (interval === null) throw new Error(`could not read --every "${every}" — try 1w, 3d, or 12h`);
+					input.repeatEveryMs = interval;
+				}
+
 				const card = app.board.createCard(input);
-				process.stdout.write(`${card.id}  ${card.state}  P${card.priority}  ${card.title}\n`);
+				const schedule = [
+					card.notBefore ? `due ${formatRelative(card.notBefore)}` : null,
+					card.repeatEveryMs ? `repeats` : null,
+				].filter(Boolean);
+				process.stdout.write(
+					`${card.id}  ${card.state}  P${card.priority}  ${card.title}` +
+						`${schedule.length > 0 ? `  (${schedule.join(', ')})` : ''}\n`,
+				);
 				return 0;
 			}
 
@@ -314,6 +338,24 @@ async function main(): Promise<number> {
 				return 0;
 			}
 
+			if (sub === 'snooze') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+				const when = flagStr(args, 'until') ?? args._.slice(3).join(' ');
+				if (!when.trim()) throw new Error('say when: e.g. "1w", "36h", or "2026-08-19"');
+
+				const dueAt = parseDueAt(when);
+				if (dueAt === null) throw new Error(`could not read "${when}" — try 7d, 12h, or 2026-08-19`);
+
+				const card = app.board.snoozeCard(id, dueAt);
+				if (!card) throw new Error(`no such card ${id}`);
+				await app.mirrorCard(card, `deferred until ${new Date(dueAt).toISOString()}`);
+				process.stdout.write(
+					`${card.id} -> ${card.state}, held until ${new Date(dueAt).toLocaleString()} (${formatRelative(dueAt)})\n`,
+				);
+				return 0;
+			}
+
 			throw new Error(`unknown card subcommand "${sub}"`);
 		} finally {
 			app.close();
@@ -342,11 +384,20 @@ async function main(): Promise<number> {
 		const byState = new Map<string, number>();
 		for (const c of cards) byState.set(c.state, (byState.get(c.state) ?? 0) + 1);
 
+		const inFlight = app.board.inFlightCount();
 		process.stdout.write(`scheduler: ${s.runState}${s.autoRun ? ' (auto-run on)' : ' (auto-run off)'}\n`);
-		if (s.currentCardId) process.stdout.write(`current:   ${s.currentCardId} · session ${s.currentSessionId ?? '—'}\n`);
+		process.stdout.write(`slots:     ${inFlight}/${app.config.maxConcurrent} in flight\n`);
+		for (const flight of s.inFlight) {
+			process.stdout.write(`  running: ${flight.cardId} · session ${flight.sessionId ?? '—'}\n`);
+		}
 		process.stdout.write(`executed:  ${s.cardsExecuted}\n`);
 		process.stdout.write(`cards:     ${[...byState].map(([k, v]) => `${k}=${v}`).join(' ') || 'none'}\n`);
 		process.stdout.write(`eligible:  ${app.board.eligibleCards().map((c) => c.id).join(', ') || 'none'}\n`);
+
+		const wakeAt = app.board.nextWakeAt();
+		if (wakeAt !== null) {
+			process.stdout.write(`next due:  ${formatRelative(wakeAt)} (${new Date(wakeAt).toLocaleString()})\n`);
+		}
 		app.close();
 		return 0;
 	}

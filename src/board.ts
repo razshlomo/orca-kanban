@@ -27,6 +27,25 @@ function rowToComment(row: Row): CardComment {
 	};
 }
 
+/** Tolerates a missing or malformed column: an unreadable slot list is not a crash. */
+function parseInFlight(raw: unknown): SchedulerStatus['inFlight'] {
+	if (typeof raw !== 'string' || raw === '') return [];
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (!Array.isArray(parsed)) return [];
+		return parsed.map((entry) => {
+			const e = entry as Record<string, unknown>;
+			return {
+				cardId: String(e['cardId'] ?? ''),
+				runId: String(e['runId'] ?? ''),
+				sessionId: e['sessionId'] === null || e['sessionId'] === undefined ? null : String(e['sessionId']),
+			};
+		});
+	} catch {
+		return [];
+	}
+}
+
 function rowToCard(row: Row): Card {
 	let dependencies: string[] = [];
 	try {
@@ -49,6 +68,9 @@ function rowToCard(row: Row): Card {
 		agent: (row['agent'] as string | null) ?? null,
 		createdAt: Number(row['created_at']),
 		updatedAt: Number(row['updated_at']),
+		notBefore: row['not_before'] === null || row['not_before'] === undefined ? null : Number(row['not_before']),
+		repeatEveryMs:
+			row['repeat_every_ms'] === null || row['repeat_every_ms'] === undefined ? null : Number(row['repeat_every_ms']),
 		claimedAt: row['claimed_at'] === null || row['claimed_at'] === undefined ? null : Number(row['claimed_at']),
 		claimedBy: (row['claimed_by'] as string | null) ?? null,
 		sessionId: (row['session_id'] as string | null) ?? null,
@@ -83,16 +105,21 @@ function rowToRun(row: Row): CardRun {
 
 /**
  * Selects runnable cards. A card is eligible only when it is Ready, unclaimed,
- * still has retry budget, and every declared dependency is Done.
+ * still has retry budget, due (`not_before` in the past or unset), and every
+ * declared dependency is Done.
  *
  * A dependency id that does not exist on the board is treated as unsatisfied,
  * so a typo blocks the card rather than silently letting it run.
+ *
+ * Takes "now" as a bound parameter so a deferred card becomes eligible on its own,
+ * with no cron and no separate timer to drift out of step.
  */
 const ELIGIBLE_SQL = `
 	SELECT * FROM cards c
 	WHERE c.state = 'Ready'
 	  AND c.claimed_by IS NULL
 	  AND c.attempt_count < c.max_attempts
+	  AND (c.not_before IS NULL OR c.not_before <= ?)
 	  AND NOT EXISTS (
 	    SELECT 1 FROM json_each(c.dependencies) dep
 	    WHERE NOT EXISTS (
@@ -137,8 +164,8 @@ export class Board extends EventEmitter {
 	}
 
 	/** Fresh read of every currently runnable card, best candidate first. */
-	eligibleCards(): Card[] {
-		return (this.db.prepare(ELIGIBLE_SQL).all() as Row[]).map(rowToCard);
+	eligibleCards(now = Date.now()): Card[] {
+		return (this.db.prepare(ELIGIBLE_SQL).all(now) as Row[]).map(rowToCard);
 	}
 
 	/**
@@ -146,9 +173,26 @@ export class Board extends EventEmitter {
 	 * nothing to do right now. This is called once per scheduler iteration and
 	 * never memoised.
 	 */
-	getNextEligibleCard(): Card | null {
-		const row = this.db.prepare(`${ELIGIBLE_SQL} LIMIT 1`).get() as Row | undefined;
+	getNextEligibleCard(now = Date.now()): Card | null {
+		const row = this.db.prepare(`${ELIGIBLE_SQL} LIMIT 1`).get(now) as Row | undefined;
 		return row ? rowToCard(row) : null;
+	}
+
+	/** How many cards are executing right now, board-wide across every worker. */
+	inFlightCount(): number {
+		return Number((this.db.prepare(`SELECT COUNT(*) AS n FROM cards WHERE state = 'In Progress'`).get() as Row)['n']);
+	}
+
+	/** The soonest moment a deferred card becomes runnable, or null when none wait. */
+	nextWakeAt(now = Date.now()): number | null {
+		const row = this.db
+			.prepare(
+				`SELECT MIN(not_before) AS at FROM cards
+				 WHERE state = 'Ready' AND claimed_by IS NULL AND not_before IS NOT NULL AND not_before > ?`,
+			)
+			.get(now) as Row | undefined;
+		const at = row?.['at'];
+		return at === null || at === undefined ? null : Number(at);
 	}
 
 	cardsInState(state: CardState): Card[] {
@@ -209,8 +253,9 @@ export class Board extends EventEmitter {
 		this.db
 			.prepare(
 				`INSERT INTO cards (id, title, description, acceptance_criteria, state, priority, board_order,
-				 dependencies, repo, agent, created_at, updated_at, attempt_count, max_attempts)
-				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?)`,
+				 dependencies, repo, agent, created_at, updated_at, attempt_count, max_attempts,
+				 not_before, repeat_every_ms)
+				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)`,
 			)
 			.run(
 				id,
@@ -226,6 +271,8 @@ export class Board extends EventEmitter {
 				now,
 				now,
 				input.maxAttempts ?? 2,
+				input.notBefore ?? null,
+				input.repeatEveryMs ?? null,
 			);
 
 		this.touched('card_created', id);
@@ -249,6 +296,8 @@ export class Board extends EventEmitter {
 		if (patch.repo !== undefined) columns['repo'] = patch.repo;
 		if (patch.agent !== undefined) columns['agent'] = patch.agent;
 		if (patch.maxAttempts !== undefined) columns['max_attempts'] = patch.maxAttempts;
+		if (patch.notBefore !== undefined) columns['not_before'] = patch.notBefore;
+		if (patch.repeatEveryMs !== undefined) columns['repeat_every_ms'] = patch.repeatEveryMs;
 
 		if (Object.keys(columns).length === 0) return existing;
 
@@ -287,6 +336,52 @@ export class Board extends EventEmitter {
 			.run(state, order ?? null, Date.now(), clearClaim ? 1 : 0, clearClaim ? 1 : 0, id);
 
 		this.touched('card_moved', id);
+		return this.rearmIfRecurring(id) ?? this.getCard(id);
+	}
+
+	/**
+	 * A recurring card does not stay finished: reaching Done schedules the next
+	 * occurrence instead, with a fresh retry budget and the claim cleared. All of its
+	 * history stays on the one card, which is the point of `repeatEveryMs`.
+	 *
+	 * Returns the re-armed card, or null when this card is not recurring / not Done.
+	 */
+	private rearmIfRecurring(id: string): Card | null {
+		const card = this.getCard(id);
+		if (!card || card.state !== 'Done' || !card.repeatEveryMs) return null;
+
+		const dueAt = Date.now() + card.repeatEveryMs;
+		this.db
+			.prepare(
+				`UPDATE cards SET state = 'Ready', not_before = ?, attempt_count = 0,
+				 claimed_by = NULL, claimed_at = NULL, updated_at = ?
+				 WHERE id = ?`,
+			)
+			.run(dueAt, Date.now(), id);
+
+		this.touched('card_rearmed', id);
+		return this.getCard(id);
+	}
+
+	/**
+	 * Defers a card: it stays where it is on the board but cannot be claimed until
+	 * `dueAt`. This is "look at this again later" without losing the card.
+	 */
+	snoozeCard(id: string, dueAt: number, options: { state?: CardState } = {}): Card | null {
+		const existing = this.getCard(id);
+		if (!existing) return null;
+
+		// A card parked in any other column would never wake by itself, so a snooze puts
+		// it in Ready and lets `not_before` hold it there until it is due.
+		const state = options.state ?? 'Ready';
+		this.db
+			.prepare(
+				`UPDATE cards SET state = ?, not_before = ?, claimed_by = NULL, claimed_at = NULL, updated_at = ?
+				 WHERE id = ?`,
+			)
+			.run(state, dueAt, Date.now(), id);
+
+		this.touched('card_snoozed', id);
 		return this.getCard(id);
 	}
 
@@ -410,12 +505,16 @@ export class Board extends EventEmitter {
 
 	/**
 	 * Atomically claims one specific card. Returns null when somebody else won the
-	 * race, the card left Ready, or its retry budget is gone.
+	 * race, the card left Ready, its retry budget is gone, it is not due yet, or the
+	 * concurrency cap is already full.
 	 *
-	 * The guard lives in the UPDATE's WHERE clause, so the winner is decided by
-	 * SQLite rather than by application-level checks.
+	 * Every guard lives in the UPDATE's WHERE clause, so the winner is decided by
+	 * SQLite rather than by application-level checks. That is what makes the cap hold
+	 * across processes: two daemons racing for the last slot cannot both win it.
 	 */
-	claimCard(id: string, workerId: string): Card | null {
+	claimCard(id: string, workerId: string, options: { maxConcurrent?: number } = {}): Card | null {
+		const maxConcurrent = Math.max(1, options.maxConcurrent ?? Number.MAX_SAFE_INTEGER);
+
 		return immediateTransaction(this.db, () => {
 			const changes = Number(
 				this.db
@@ -427,6 +526,8 @@ export class Board extends EventEmitter {
 						   AND state = 'Ready'
 						   AND claimed_by IS NULL
 						   AND attempt_count < max_attempts
+						   AND (not_before IS NULL OR not_before <= ?)
+						   AND (SELECT COUNT(*) FROM cards busy WHERE busy.state = 'In Progress') < ?
 						   AND NOT EXISTS (
 						     SELECT 1 FROM json_each(cards.dependencies) dep
 						     WHERE NOT EXISTS (
@@ -434,7 +535,7 @@ export class Board extends EventEmitter {
 						     )
 						   )`,
 					)
-					.run(workerId, Date.now(), Date.now(), id).changes,
+					.run(workerId, Date.now(), Date.now(), id, Date.now(), maxConcurrent).changes,
 			);
 
 			if (changes !== 1) return null;
@@ -639,7 +740,10 @@ export class Board extends EventEmitter {
 
 		this.emit('board_changed', { reason: 'result_persisted', cardId: card.id });
 		if (!updated) throw new Error(`persistResult lost card ${card.id}`);
-		return updated;
+
+		// With successState "Done" a card can finish unattended, so recurrence has to be
+		// re-armed here too — not only on the human's approve/move path.
+		return this.rearmIfRecurring(card.id) ?? updated;
 	}
 
 	recordEvent(
@@ -668,6 +772,7 @@ export class Board extends EventEmitter {
 			currentCardId: (row['current_card_id'] as string | null) ?? null,
 			currentRunId: (row['current_run_id'] as string | null) ?? null,
 			currentSessionId: (row['current_session_id'] as string | null) ?? null,
+			inFlight: parseInFlight(row['in_flight']),
 			startedAt: row['started_at'] === null ? null : Number(row['started_at']),
 			lastCardFinishedAt: row['last_card_finished_at'] === null ? null : Number(row['last_card_finished_at']),
 			cardsExecuted: Number(row['cards_executed'] ?? 0),
@@ -681,6 +786,7 @@ export class Board extends EventEmitter {
 		currentCardId?: string | null;
 		currentRunId?: string | null;
 		currentSessionId?: string | null;
+		inFlight?: SchedulerStatus['inFlight'];
 		startedAt?: number | null;
 		lastCardFinishedAt?: number | null;
 		cardsExecuted?: number;
@@ -694,6 +800,7 @@ export class Board extends EventEmitter {
 		if (patch.currentCardId !== undefined) columns['current_card_id'] = patch.currentCardId;
 		if (patch.currentRunId !== undefined) columns['current_run_id'] = patch.currentRunId;
 		if (patch.currentSessionId !== undefined) columns['current_session_id'] = patch.currentSessionId;
+		if (patch.inFlight !== undefined) columns['in_flight'] = JSON.stringify(patch.inFlight);
 		if (patch.startedAt !== undefined) columns['started_at'] = patch.startedAt;
 		if (patch.lastCardFinishedAt !== undefined) columns['last_card_finished_at'] = patch.lastCardFinishedAt;
 		if (patch.cardsExecuted !== undefined) columns['cards_executed'] = patch.cardsExecuted;

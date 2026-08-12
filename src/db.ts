@@ -109,6 +109,20 @@ const MIGRATIONS: string[] = [
 
 	CREATE INDEX idx_comments_card ON card_comments (card_id, created_at ASC);
 	`,
+	// v3 — deferred and recurring cards.
+	`
+	/* Epoch ms before which the card must not run. NULL means "runnable now". */
+	ALTER TABLE cards ADD COLUMN not_before INTEGER;
+	/* When set, reaching Done re-arms the card this many ms into the future. */
+	ALTER TABLE cards ADD COLUMN repeat_every_ms INTEGER;
+
+	DROP INDEX IF EXISTS idx_cards_pick;
+	CREATE INDEX idx_cards_pick ON cards (state, not_before, priority DESC, board_order ASC, created_at ASC);
+
+	/* Every card the owning scheduler is executing, as JSON. current_card_id keeps
+	   reporting the oldest of them so existing readers are unaffected. */
+	ALTER TABLE scheduler_state ADD COLUMN in_flight TEXT NOT NULL DEFAULT '[]';
+	`,
 ];
 
 /**

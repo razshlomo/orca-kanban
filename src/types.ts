@@ -49,6 +49,17 @@ export type Card = {
   createdAt: number;
   updatedAt: number;
 
+  /**
+   * Epoch ms before which this card must not run. `null` means runnable now.
+   * This is how "look at Y again in a week" is expressed.
+   */
+  notBefore: number | null;
+  /**
+   * When set, reaching Done re-arms the card `repeatEveryMs` into the future
+   * instead of leaving it finished — a recurring check that keeps one history.
+   */
+  repeatEveryMs: number | null;
+
   claimedAt: number | null;
   claimedBy: string | null;
 
@@ -81,6 +92,8 @@ export type CardInput = {
   repo?: string | null;
   agent?: string | null;
   maxAttempts?: number;
+  notBefore?: number | null;
+  repeatEveryMs?: number | null;
   id?: string;
 };
 
@@ -186,6 +199,12 @@ export type KanbanConfig = {
   enabled: boolean;
   autoRun: boolean;
   pollIntervalMs: number;
+  /**
+   * Hard ceiling on cards executing at once, board-wide. Enforced inside the claim
+   * transaction, so no number of daemons, UI clicks or `run --once` calls can exceed
+   * it. 1 keeps execution strictly sequential.
+   */
+  maxConcurrent: number;
   defaultAgent: string;
   maxAttempts: number;
   /** Where a successful card lands. */
@@ -238,6 +257,11 @@ export type SchedulerStatus = {
   currentCardId: string | null;
   currentRunId: string | null;
   currentSessionId: string | null;
+  /**
+   * Every card the owning scheduler is executing. `currentCardId` above is the
+   * oldest of these, so single-slot readers see no change.
+   */
+  inFlight: Array<{ cardId: string; runId: string; sessionId: string | null }>;
   startedAt: number | null;
   lastCardFinishedAt: number | null;
   cardsExecuted: number;

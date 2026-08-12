@@ -140,6 +140,21 @@ kanban card show <id>
 Each card is mirrored onto its Orca worktree, so it also appears in the matching
 column of Orca's own workspace board.
 
+## Deferring and repeating
+
+When the user wants something looked at later, or on a cycle, put it on the board
+with a schedule instead of leaving a reminder in prose:
+
+```bash
+kanban card add "Check the status of Y" --state Ready --not-before 7d
+kanban card add "Weekly dependency audit" --state Ready --every 1w
+kanban card snooze <id> 1w        # defer something already on the board
+```
+
+Durations are `30m`, `2h`, `7d`, `1w`, or a date like `2026-08-19`. A held card
+stays in Ready and simply is not eligible until it is due, so nothing runs early.
+A card created with `--every` re-arms itself each time it reaches Done.
+
 ## Review is the human's call, not yours
 
 A finished card stops in **Review**. `kanban card approve` and `kanban card reject`

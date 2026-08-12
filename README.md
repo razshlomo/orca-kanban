@@ -324,6 +324,99 @@ Done.
 
 ---
 
+## How many cards run at once
+
+`maxConcurrent` (default **1**) is a hard ceiling on cards executing at the same
+time, board-wide:
+
+```json
+{ "maxConcurrent": 3 }
+```
+
+Two things enforce it, and the second is the one that matters:
+
+1. The scheduler loop fills at most `maxConcurrent` slots, starting a new card the
+   moment any lane frees rather than waiting for the whole batch.
+2. **The claim itself refuses to exceed it.** The count lives inside the same
+   `BEGIN IMMEDIATE` transaction that moves a card `Ready -> In Progress`:
+
+```sql
+AND (SELECT COUNT(*) FROM cards WHERE state = 'In Progress') < :maxConcurrent
+```
+
+So the limit holds across *processes*, not just inside one loop. Two daemons, a UI
+click and a `kanban run --once` racing for the last slot cannot all win — SQLite picks
+one. Without that guard a second `kanban serve --auto-run` would silently double your
+agent count.
+
+`kanban status` shows the occupancy and every lane:
+
+```
+slots:     2/3 in flight
+  running: card_5eb1d168 · session term_03bc4a5c…
+  running: card_1a6ba9dd · session term_e14bdd7a…
+```
+
+Stop one lane without touching the others:
+
+```bash
+curl -XPOST localhost:7420/api/scheduler/stop-current -d '{"cardId":"card_5eb1d168"}'
+```
+
+The UI card panel has the same control as **Stop this card now**, and the header shows
+`n/N slots`.
+
+> Raising this multiplies real agents against real repos. Each card still gets its own
+> worktree, so they do not fight over files, but they do share your machine, your API
+> quota, and any service the tests talk to.
+
+---
+
+## Scheduling work for later
+
+A card can be held until a moment in the future. `notBefore` is checked by the same
+eligibility query that gates state, claims, retries and dependencies — so nothing runs
+early, and no cron is involved:
+
+```bash
+# look at this in a week
+kanban card add "Check the status of Y" --state Ready --not-before 7d
+
+# or defer something already on the board
+kanban card snooze card_ab12cd34 1w
+kanban card snooze card_ab12cd34 2026-08-19
+```
+
+Durations are `30m`, `2h`, `7d`, `1w`, or compound `1w2d`; a bare number means minutes.
+Anything unparseable is an error rather than a silently wrong date. A held card sits in
+**Ready** with a `due in 6d` tag, and `kanban status` reports the next wake-up:
+
+```
+next due:  in 7d (8/19/2026, 2:39:01 PM)
+```
+
+### Recurring checks
+
+`--every <duration>` makes a card re-arm itself instead of finishing. When it reaches
+Done — whether a human approved it or `successState: "Done"` finished it unattended —
+it returns to **Ready** with a fresh retry budget and its next due time:
+
+```bash
+kanban card add "Weekly dependency audit" --state Ready --every 1w \
+  --description "Check for outdated dependencies and report what changed."
+```
+
+All occurrences share one card, so `card_runs` accumulates the whole series and
+`kanban card show` reads as a history of that recurring job. Set the interval later from
+the UI's **Repeat every** field, or clear it by patching `repeatEveryMs` to null.
+
+> For work that does not belong on the board at all, Orca has its own scheduler:
+> `orca automations create --trigger cron|rrule --prompt … --provider omp`. Use the board
+> when you want the run tracked, reviewable and dependency-aware; use an automation for
+> fire-and-forget prompts.
+
+---
+
 ## Recovering and retrying cards
 
 A card that fails is returned to **Ready** while `attemptCount < maxAttempts`, and moves
@@ -389,8 +482,9 @@ columns for.
 | GET/POST | `/api/cards/:id/comments` | read or append to the review trail |
 | GET | `/api/cards/:id/diff` | the card patch, untracked files included |
 | POST | `/api/cards/:id/open` | open `changes` or `session` in Orca |
+| POST | `/api/cards/:id/snooze` | `{ "until": "7d" }` — hold the card until due |
 | POST | `/api/cards/reorder` | `{ "ids": [...] }` |
-| POST | `/api/scheduler/{start,pause,autorun,stop-after-current,stop-current,run-once,recover}` | controls |
+| POST | `/api/scheduler/{start,pause,autorun,stop-after-current,stop-current,run-once,recover}` | controls; `stop-current` takes an optional `{ "cardId": … }` |
 
 ---
 
@@ -429,7 +523,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 109 tests
+npm test          # 128 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```

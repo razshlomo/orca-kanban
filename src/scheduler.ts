@@ -21,13 +21,26 @@ export type IterationOutcome = {
 	result: ExecutionResult;
 } | null;
 
+/** A card this process is executing right now. */
+type InFlight = {
+	card: Card;
+	runId: string;
+	sessionId: string | null;
+	abort: AbortController;
+	settled: Promise<IterationOutcome>;
+};
+
 /**
- * Sequential card scheduler.
+ * Card scheduler.
  *
- * The single hard rule: every iteration re-reads the board from SQLite and picks
- * again. There is no queue, no snapshot, and no precomputed plan — so cards added,
- * removed, reprioritised, or blocked while a card is running all take effect on
- * the very next selection.
+ * The single hard rule: every pick re-reads the board from SQLite. There is no
+ * queue, no snapshot, and no precomputed plan — so cards added, removed,
+ * reprioritised, or blocked while other cards run all take effect on the very next
+ * selection.
+ *
+ * Concurrency has two halves. This loop fills up to `maxConcurrent` slots, and the
+ * board enforces the same ceiling inside the claim transaction — so the limit holds
+ * even when several schedulers, a UI and a one-shot CLI all race for the last slot.
  */
 export class Scheduler extends EventEmitter {
 	private readonly board: Board;
@@ -38,10 +51,9 @@ export class Scheduler extends EventEmitter {
 
 	private running = false;
 	private stopAfterCurrentFlag = false;
-	private currentAbort: AbortController | null = null;
 	private loopPromise: Promise<void> | null = null;
 	private wake: (() => void) | null = null;
-	private busy = false;
+	private readonly inFlight = new Map<string, InFlight>();
 
 	constructor(deps: SchedulerDeps) {
 		super();
@@ -63,7 +75,17 @@ export class Scheduler extends EventEmitter {
 	}
 
 	get isBusy(): boolean {
-		return this.busy;
+		return this.inFlight.size > 0;
+	}
+
+	/** Cards this process is executing right now. */
+	get inFlightCards(): InFlight[] {
+		return [...this.inFlight.values()];
+	}
+
+	/** Free slots left to this process, before the board's own ceiling is consulted. */
+	private get freeSlots(): number {
+		return Math.max(0, this.config.maxConcurrent - this.inFlight.size);
 	}
 
 	status(): SchedulerStatus {
@@ -106,21 +128,27 @@ export class Scheduler extends EventEmitter {
 		this.wakeUp();
 	}
 
-	/** Aborts the in-flight card immediately (its Orca session is interrupted). */
-	stopCurrentCard(): boolean {
-		if (!this.currentAbort) return false;
-		this.currentAbort.abort();
+	/**
+	 * Aborts an in-flight card immediately (its Orca session is interrupted).
+	 * Without a card id, aborts every card this scheduler is running.
+	 */
+	stopCurrentCard(cardId?: string): boolean {
+		const targets = cardId ? [this.inFlight.get(cardId)].filter(Boolean) : [...this.inFlight.values()];
+		if (targets.length === 0) return false;
+
+		for (const target of targets as InFlight[]) target.abort.abort();
 		this.wakeUp();
 		return true;
 	}
 
-	/** Stops the loop entirely and waits for the in-flight card to settle. */
+	/** Stops the loop entirely and waits for every in-flight card to settle. */
 	async stop(options: { abortCurrent?: boolean } = {}): Promise<void> {
 		this.running = false;
-		if (options.abortCurrent) this.currentAbort?.abort();
+		if (options.abortCurrent) for (const flight of this.inFlight.values()) flight.abort.abort();
 		this.wakeUp();
 		await this.loopPromise?.catch(() => {});
 		this.loopPromise = null;
+		await Promise.allSettled([...this.inFlight.values()].map((f) => f.settled));
 		this.board.patchSchedulerState({ runState: 'stopped', currentCardId: null, currentRunId: null, currentSessionId: null });
 	}
 
@@ -136,25 +164,41 @@ export class Scheduler extends EventEmitter {
 
 			if (!this.board.schedulerStatus().autoRun) {
 				this.board.patchSchedulerState({ runState: 'paused' });
-				await this.waitForBoardChangeOrPoll();
+				await this.waitForWork();
 				continue;
 			}
 
-			// ---- fresh board read happens inside runOnce, every single iteration.
-			const outcome = await this.runOnce();
+			// Fill every free slot. Each claim is its own fresh board read, so a card
+			// added while the previous one was starting is still seen on this pass.
+			let started = 0;
+			while (this.running && !this.stopAfterCurrentFlag && this.freeSlots > 0) {
+				const flight = this.claimAndStart();
+				if (!flight) break;
+				started += 1;
+			}
 
-			if (this.stopAfterCurrentFlag) {
+			if (this.stopAfterCurrentFlag && this.inFlight.size === 0) {
 				this.stopAfterCurrentFlag = false;
 				this.board.patchSchedulerState({ autoRun: false, stopAfterCurrent: false, runState: 'paused' });
 				this.emitEvent('scheduler_idle', { reason: 'stop_after_current' });
 				continue;
 			}
 
-			if (!outcome) {
+			if (this.inFlight.size > 0) {
+				// Wait for whichever card finishes first, so its slot is refilled at once
+				// rather than after the whole batch drains.
+				await Promise.race([
+					Promise.allSettled([...this.inFlight.values()].map((f) => f.settled)).then(() => undefined),
+					...[...this.inFlight.values()].map((f) => f.settled.then(() => undefined)),
+				]);
+				continue;
+			}
+
+			if (started === 0) {
 				this.board.patchSchedulerState({ runState: 'idle' });
 				this.emitEvent('scheduler_idle', { reason: 'no_eligible_cards' });
 				this.emit('idle');
-				await this.waitForBoardChangeOrPoll();
+				await this.waitForWork();
 			}
 		}
 
@@ -162,12 +206,11 @@ export class Scheduler extends EventEmitter {
 	}
 
 	/**
-	 * One full cycle: fresh read → atomic claim → execute → persist.
-	 * Returns null when the board currently has nothing runnable.
-	 *
-	 * Safe to call directly (the CLI's one-shot mode and the tests both do).
+	 * Claims the next eligible card and starts it WITHOUT awaiting, so several cards
+	 * can be in flight at once. Returns null when nothing is runnable or the board
+	 * refused the claim — which includes the concurrency ceiling being full.
 	 */
-	async runOnce(): Promise<IterationOutcome> {
+	private claimAndStart(): InFlight | null {
 		// FRESH READ — never a cached list.
 		const candidate = this.board.getNextEligibleCard();
 		if (!candidate) return null;
@@ -179,10 +222,57 @@ export class Scheduler extends EventEmitter {
 			title: candidate.title,
 		});
 
-		// Atomic Ready -> In Progress. Losing the race simply means re-reading.
-		const card = this.board.claimCard(candidate.id, this.config.workerId);
+		const card = this.claim(candidate);
+		if (!card) return null;
+
+		const run = this.board.startRun(card.id, null);
+		const abort = new AbortController();
+		const flight: InFlight = {
+			card,
+			runId: run.id,
+			sessionId: null,
+			abort,
+			// Assigned below; the map entry must exist before the work can complete.
+			settled: Promise.resolve(null),
+		};
+
+		this.inFlight.set(card.id, flight);
+		flight.settled = this.runInSlot(flight, run, {});
+		return flight;
+	}
+
+	/** Runs one card to completion and frees its slot, whatever the outcome. */
+	private async runInSlot(
+		flight: InFlight,
+		run: CardRun,
+		options: { resume?: ResumeTarget },
+	): Promise<IterationOutcome> {
+		try {
+			await this.mirror(
+				flight.card,
+				'In Progress',
+				`running (attempt ${flight.card.attemptCount}/${flight.card.maxAttempts})`,
+			);
+			return await this.executeAndPersist(flight, run, options);
+		} finally {
+			this.inFlight.delete(flight.card.id);
+			this.publishInFlight();
+			this.wakeUp();
+		}
+	}
+
+	/** Atomic Ready -> In Progress, with the board's ceiling applied. */
+	private claim(candidate: Card): Card | null {
+		const card = this.board.claimCard(candidate.id, this.config.workerId, {
+			maxConcurrent: this.config.maxConcurrent,
+		});
+
 		if (!card) {
-			this.log.warn('claim lost, re-reading board', { cardId: candidate.id });
+			this.log.warn('claim refused, re-reading board', {
+				cardId: candidate.id,
+				inFlight: this.board.inFlightCount(),
+				maxConcurrent: this.config.maxConcurrent,
+			});
 			return null;
 		}
 
@@ -191,19 +281,42 @@ export class Scheduler extends EventEmitter {
 			claimedBy: card.claimedBy,
 			attempt: card.attemptCount,
 			maxAttempts: card.maxAttempts,
+			slot: `${this.inFlight.size + 1}/${this.config.maxConcurrent}`,
 		});
+		return card;
+	}
 
-		await this.mirror(card, 'In Progress', `running (attempt ${card.attemptCount}/${card.maxAttempts})`);
-		return this.executeAndPersist(card, {});
+	/**
+	 * One full cycle, awaited to completion: fresh read → claim → execute → persist.
+	 * Returns null when the board currently has nothing runnable.
+	 *
+	 * The CLI's one-shot mode and the tests use this; the loop uses `claimAndStart`
+	 * so it can hold several cards at once.
+	 */
+	async runOnce(): Promise<IterationOutcome> {
+		const flight = this.claimAndStart();
+		if (!flight) return null;
+		return flight.settled;
 	}
 
 	/**
 	 * Re-attaches to a card whose Orca worktree and agent survived a restart.
-	 * The card is already claimed and In Progress, so it keeps its original run.
+	 * The card is already claimed and In Progress, so it keeps its original run — and
+	 * it occupies one of this scheduler's slots like any other card.
 	 */
 	async adoptCard(card: Card, run: CardRun, resume: ResumeTarget): Promise<IterationOutcome> {
 		this.emitEvent('card_recovered', { cardId: card.id, runId: run.id, sessionId: resume.sessionId, action: 'adopt' });
-		return this.executeAndPersist(card, { run, resume });
+
+		const flight: InFlight = {
+			card,
+			runId: run.id,
+			sessionId: resume.sessionId,
+			abort: new AbortController(),
+			settled: Promise.resolve(null),
+		};
+		this.inFlight.set(card.id, flight);
+		flight.settled = this.runInSlot(flight, run, { resume });
+		return flight.settled;
 	}
 
 	/**
@@ -211,33 +324,26 @@ export class Scheduler extends EventEmitter {
 	 * lifecycle events, and mirror the resulting state onto Orca's board.
 	 */
 	private async executeAndPersist(
-		card: Card,
-		options: { run?: CardRun; resume?: ResumeTarget },
+		flight: InFlight,
+		run: CardRun,
+		options: { resume?: ResumeTarget },
 	): Promise<IterationOutcome> {
-		const run = options.run ?? this.board.startRun(card.id, null);
-		const abort = new AbortController();
-		this.currentAbort = abort;
-		this.busy = true;
-
-		this.board.patchSchedulerState({
-			runState: 'running',
-			currentCardId: card.id,
-			currentRunId: run.id,
-			currentSessionId: options.resume?.sessionId ?? null,
-		});
+		const card = flight.card;
+		this.publishInFlight();
 		this.emit('card_started', { card, runId: run.id });
 
 		let result: ExecutionResult;
 		try {
 			result = await this.executor(card, {
 				runId: run.id,
-				signal: abort.signal,
+				signal: flight.abort.signal,
 				log: this.log,
 				resume: options.resume,
 				onSession: (info) => {
+					flight.sessionId = info.sessionId;
 					this.board.updateRunSession(run.id, info.sessionId);
-					this.board.patchSchedulerState({ currentSessionId: info.sessionId });
 					this.board.attachSession(card.id, info);
+					this.publishInFlight();
 					this.emitEvent('session_started', { cardId: card.id, runId: run.id, ...info });
 				},
 			});
@@ -262,9 +368,6 @@ export class Scheduler extends EventEmitter {
 				startedAt: run.startedAt,
 				finishedAt: Date.now(),
 			};
-		} finally {
-			this.currentAbort = null;
-			this.busy = false;
 		}
 
 		const persisted = this.board.persistResult(card, result, { successState: this.config.successState });
@@ -307,10 +410,6 @@ export class Scheduler extends EventEmitter {
 
 		const status = this.board.schedulerStatus();
 		this.board.patchSchedulerState({
-			runState: 'idle',
-			currentCardId: null,
-			currentRunId: null,
-			currentSessionId: null,
 			lastCardFinishedAt: Date.now(),
 			cardsExecuted: status.cardsExecuted + 1,
 		});
@@ -318,12 +417,41 @@ export class Scheduler extends EventEmitter {
 		this.emit('card_finished', { card: persisted, result });
 		return { card: persisted, result };
 	}
+	/**
+	 * Mirrors this process's slots into the scheduler row so the UI and other
+	 * processes can see every card in flight, not just the first one.
+	 *
+	 * `currentCardId` keeps reporting the oldest in-flight card, so a single-slot
+	 * setup and every existing reader behave exactly as before.
+	 */
+	private publishInFlight(): void {
+		const flights = [...this.inFlight.values()];
+		const oldest = flights[0];
+
+		this.board.patchSchedulerState({
+			runState: flights.length > 0 ? 'running' : 'idle',
+			currentCardId: oldest?.card.id ?? null,
+			currentRunId: oldest?.runId ?? null,
+			currentSessionId: oldest?.sessionId ?? null,
+			inFlight: flights.map((f) => ({ cardId: f.card.id, runId: f.runId, sessionId: f.sessionId })),
+		});
+	}
 
 	/**
-	 * Sleeps until the board changes, the poll interval elapses, or a control
-	 * wakes us. Never a busy loop.
+	 * Sleeps until the board changes, a deferred card comes due, the poll interval
+	 * elapses, or a control wakes us. Never a busy loop.
 	 */
-	private waitForBoardChangeOrPoll(): Promise<void> {
+	private waitForWork(): Promise<void> {
+		const dueAt = this.board.nextWakeAt();
+		const untilDue = dueAt === null ? Number.POSITIVE_INFINITY : Math.max(0, dueAt - Date.now());
+		return this.waitForBoardChangeOrPoll(Math.min(this.config.pollIntervalMs, untilDue));
+	}
+
+	/**
+	 * Sleeps until the board changes, `withinMs` elapses, or a control wakes us.
+	 * Never a busy loop.
+	 */
+	private waitForBoardChangeOrPoll(withinMs = this.config.pollIntervalMs): Promise<void> {
 		const { promise, resolve } = Promise.withResolvers<void>();
 		let settled = false;
 
@@ -335,7 +463,7 @@ export class Scheduler extends EventEmitter {
 			resolve();
 		};
 
-		const timer = setTimeout(finish, this.config.pollIntervalMs);
+		const timer = setTimeout(finish, withinMs);
 		if (typeof timer.unref === 'function') timer.unref();
 		this.wake = finish;
 

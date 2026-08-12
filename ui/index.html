@@ -135,6 +135,18 @@
 
 			const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
 
+			/** Compact "in 6d" for scheduled cards; mirrors formatRelative in src/text.ts. */
+			const rel = (at) => {
+				const d = at - Date.now();
+				const abs = Math.abs(d);
+				const [n, u] =
+					abs >= 86400000 ? [Math.round(abs / 86400000), 'd']
+					: abs >= 3600000 ? [Math.round(abs / 3600000), 'h']
+					: abs >= 60000 ? [Math.round(abs / 60000), 'm']
+					: [Math.round(abs / 1000), 's'];
+				return d >= 0 ? `in ${n}${u}` : `${n}${u} ago`;
+			};
+
 			// The panel re-renders on every poll, so a fetched diff is cached here or it
 			// would vanish a second after you asked for it.
 			let diffCache = { cardId: null, text: '' };
@@ -145,10 +157,16 @@
 				const color = running ? 'var(--ok)' : s.autoRun ? 'var(--warn)' : 'var(--muted)';
 				document.getElementById('sstate').innerHTML =
 					`<span class="dot" style="background:${color}"></span>${esc(s.runState || '—')}${s.autoRun ? ' · auto' : ''}`;
-				document.getElementById('scur').textContent = s.currentCardId
-					? `card ${s.currentCardId}${s.currentSessionId ? ' · ' + s.currentSessionId.slice(0, 18) : ''}`
-					: '';
-				document.getElementById('scount').textContent = `${s.cardsExecuted ?? 0} executed`;
+				document.getElementById('scount').textContent =
+					`${s.cardsExecuted ?? 0} executed · ${s.inFlightCount ?? 0}/${s.maxConcurrent ?? 1} slots`;
+
+				// Every lane, not just the first, so a multi-slot board is legible.
+				const lanes = s.inFlight || [];
+				document.getElementById('scur').textContent = lanes.length
+					? lanes.map((f) => `${f.cardId}${f.sessionId ? ' · ' + f.sessionId.slice(0, 14) : ''}`).join('  |  ')
+					: s.nextWakeAt
+						? `next due ${rel(s.nextWakeAt)}`
+						: '';
 
 				// The button must say what it will DO, based on what the scheduler is
 				// actually doing right now — a static label lies after the first click.
@@ -197,6 +215,8 @@
 						${c.dependencies.length ? `<span class="tag">deps ${c.dependencies.length}</span>` : ''}
 						${c.attemptCount ? `<span class="tag">try ${c.attemptCount}/${c.maxAttempts}</span>` : ''}
 						${eligible ? '<span class="tag" style="color:var(--ok)">eligible</span>' : ''}
+						${c.notBefore && c.notBefore > Date.now() ? `<span class="tag" style="color:var(--warn)">due ${rel(c.notBefore)}</span>` : ''}
+						${c.repeatEveryMs ? '<span class="tag">repeats</span>' : ''}
 						${c.lastResult ? `<span class="tag ${c.lastResult === 'DONE' ? '' : 'err'}">${esc(c.lastResult)}</span>` : ''}
 					</div>`;
 				el.addEventListener('dragstart', () => { dragId = c.id; });
@@ -207,6 +227,7 @@
 			async function renderPanel() {
 				const c = snapshot.cards.find((x) => x.id === selectedId);
 				if (!c) return closePanel();
+				const inFlightIds = ((snapshot.scheduler || {}).inFlight || []).map((f) => f.cardId);
 				const panel = document.getElementById('panel');
 				panel.classList.remove('hidden');
 				let runs = [];
@@ -240,6 +261,27 @@
 						<button class="primary" onclick="saveCard()">Save</button>
 						<button onclick="retryCard()">Retry</button>
 						<button class="danger" onclick="deleteCard()">Delete</button>
+					</div>
+
+					<div class="review">
+						<label>Schedule</label>
+						<div class="row">
+							<div>
+								<label>Hold until</label>
+								<input id="f-snooze" placeholder="7d, 12h or 2026-08-19" />
+							</div>
+							<div>
+								<label>Repeat every</label>
+								<input id="f-every" placeholder="1w, 3d, 12h" value="${c.repeatEveryMs ? Math.round(c.repeatEveryMs / 3600000) + 'h' : ''}" />
+							</div>
+						</div>
+						<div class="row" style="margin-top:6px">
+							<button onclick="snoozeCard()">Hold</button>
+							<button onclick="saveRepeat()">Save repeat</button>
+							<button ${c.notBefore ? '' : 'disabled'} onclick="clearSchedule()">Clear</button>
+						</div>
+						${c.notBefore ? `<div class="hint">Held until ${new Date(c.notBefore).toLocaleString()} (${rel(c.notBefore)}).</div>` : ''}
+						${inFlightIds.includes(c.id) ? '<button class="danger" style="margin-top:8px" onclick="stopThisCard()">Stop this card now</button>' : ''}
 					</div>
 
 					<div class="review">
@@ -310,6 +352,48 @@
 			async function retryCard() {
 				await api(`/api/cards/${encodeURIComponent(selectedId)}/retry`, 'POST', {});
 				await refresh();
+			}
+
+			async function snoozeCard() {
+				const until = (document.getElementById('f-snooze').value || '').trim();
+				if (!until) return alert('Say when: 7d, 12h, or a date like 2026-08-19.');
+				try {
+					await api(`/api/cards/${encodeURIComponent(selectedId)}/snooze`, 'POST', { until });
+				} catch (e) {
+					return alert(e.message);
+				}
+				editing = false;
+				await refresh();
+			}
+
+			async function saveRepeat() {
+				const every = (document.getElementById('f-every').value || '').trim();
+				const ms = every ? durationMs(every) : null;
+				if (every && ms === null) return alert('Could not read that interval. Try 1w, 3d or 12h.');
+				await api(`/api/cards/${encodeURIComponent(selectedId)}`, 'PATCH', { repeatEveryMs: ms });
+				editing = false;
+				await refresh();
+			}
+
+			async function clearSchedule() {
+				await api(`/api/cards/${encodeURIComponent(selectedId)}`, 'PATCH', { notBefore: null });
+				await refresh();
+			}
+
+			async function stopThisCard() {
+				if (!confirm('Interrupt this card\u2019s agent now?')) return;
+				await api('/api/scheduler/stop-current', 'POST', { cardId: selectedId });
+				await refresh();
+			}
+
+			/** Mirrors parseDuration in src/text.ts; the server validates again anyway. */
+			function durationMs(value) {
+				const units = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
+				const text = value.trim().toLowerCase();
+				if (/^\d+$/.test(text)) return Number(text) * units.m;
+				const parts = text.match(/\d+[smhdw]/g);
+				if (!parts || parts.join('') !== text) return null;
+				return parts.reduce((sum, p) => sum + Number(p.slice(0, -1)) * units[p.slice(-1)], 0) || null;
 			}
 
 			const commentText = () => (document.getElementById('f-comment')?.value ?? '').trim();

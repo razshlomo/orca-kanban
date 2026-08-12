@@ -47,3 +47,61 @@ export function slugify(value: string, maxLength = 40): string {
 		.replace(/-+$/, '');
 	return slug || 'card';
 }
+
+const DURATION_UNITS: Record<string, number> = {
+	s: 1000,
+	m: 60_000,
+	h: 3_600_000,
+	d: 86_400_000,
+	w: 604_800_000,
+};
+
+/**
+ * Parses a human duration like `30m`, `2h`, `7d`, `1w`, or a compound `1w2d`.
+ * Returns null for anything it does not fully understand, so a typo becomes a
+ * visible error instead of a silently wrong schedule.
+ */
+export function parseDuration(value: string): number | null {
+	const text = value.trim().toLowerCase();
+	if (text === '') return null;
+
+	// Bare number means minutes; that is the least surprising default for a snooze.
+	if (/^\d+$/.test(text)) return Number(text) * DURATION_UNITS['m']!;
+
+	const parts = text.match(/\d+[smhdw]/g);
+	if (!parts || parts.join('') !== text) return null;
+
+	let total = 0;
+	for (const part of parts) {
+		const unit = DURATION_UNITS[part.slice(-1)];
+		if (!unit) return null;
+		total += Number(part.slice(0, -1)) * unit;
+	}
+	return total > 0 ? total : null;
+}
+
+/**
+ * Resolves what a user typed into an absolute epoch-ms deadline: either a duration
+ * from now (`7d`) or a date/datetime (`2026-08-19`, ISO 8601). Null when neither.
+ */
+export function parseDueAt(value: string, now = Date.now()): number | null {
+	const duration = parseDuration(value);
+	if (duration !== null) return now + duration;
+
+	const parsed = Date.parse(value.trim());
+	return Number.isNaN(parsed) ? null : parsed;
+}
+
+/** Compact "in 6d" / "2h ago" for board display. */
+export function formatRelative(at: number, now = Date.now()): string {
+	const delta = at - now;
+	const abs = Math.abs(delta);
+	const [unit, ms] =
+		abs >= DURATION_UNITS['d']! ? ['d', DURATION_UNITS['d']!]
+		: abs >= DURATION_UNITS['h']! ? ['h', DURATION_UNITS['h']!]
+		: abs >= DURATION_UNITS['m']! ? ['m', DURATION_UNITS['m']!]
+		: ['s', DURATION_UNITS['s']!];
+
+	const n = Math.round(abs / (ms as number));
+	return delta >= 0 ? `in ${n}${unit}` : `${n}${unit} ago`;
+}

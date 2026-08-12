@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gitReviewDiff } from './git.ts';
+import { parseDueAt } from './text.ts';
 import type { App } from './app.ts';
 import { isCardState, type Card, type CardInput, type CardState } from './types.ts';
 
@@ -56,6 +57,9 @@ function cardInputFrom(body: Record<string, unknown>): Partial<CardInput> & { st
 	if (Array.isArray(body['dependencies'])) patch.dependencies = body['dependencies'].map(String);
 	if ('repo' in body) patch.repo = str(body['repo']) ?? null;
 	if ('agent' in body) patch.agent = str(body['agent']) ?? null;
+	// A schedule is clearable, so an explicit null must survive as null.
+	if ('notBefore' in body) patch.notBefore = num(body['notBefore']) ?? null;
+	if ('repeatEveryMs' in body) patch.repeatEveryMs = num(body['repeatEveryMs']) ?? null;
 	if (isCardState(body['state'])) patch.state = body['state'];
 	return patch;
 }
@@ -71,6 +75,9 @@ function stateSnapshot(app: App): Record<string, unknown> {
 			...status,
 			isRunning: app.scheduler.isRunning,
 			isBusy: app.scheduler.isBusy,
+			maxConcurrent: app.config.maxConcurrent,
+			inFlightCount: app.board.inFlightCount(),
+			nextWakeAt: app.board.nextWakeAt(),
 		},
 		config: {
 			defaultAgent: app.config.defaultAgent,
@@ -78,6 +85,7 @@ function stateSnapshot(app: App): Record<string, unknown> {
 			successState: app.config.successState,
 			maxAttempts: app.config.maxAttempts,
 			pollIntervalMs: app.config.pollIntervalMs,
+			maxConcurrent: app.config.maxConcurrent,
 			agents: Object.keys(app.config.agents),
 			mirrorToOrcaBoard: app.config.mirrorToOrcaBoard,
 			orchestrationEnabled: app.config.orchestration.enabled,
@@ -184,6 +192,20 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 			return;
 		}
 
+		if (action === '/snooze' && method === 'POST') {
+			const body = await readBody(req);
+			const until = str(body['until']);
+			const dueAt = until ? parseDueAt(until) : num(body['notBefore']);
+			if (dueAt === undefined || dueAt === null) {
+				return send(res, 400, { error: 'until must be a duration like "7d" or a date, or pass notBefore in epoch ms' });
+			}
+
+			const snoozed = app.board.snoozeCard(id, dueAt);
+			if (snoozed) await app.mirrorCard(snoozed, `deferred until ${new Date(dueAt).toISOString()}`);
+			send(res, 200, { card: snoozed });
+			return;
+		}
+
 		if (action === '/approve' && method === 'POST') {
 			const body = await readBody(req);
 			const state = body['state'];
@@ -277,9 +299,12 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 			case 'stop-after-current':
 				app.scheduler.stopAfterCurrent();
 				break;
-			case 'stop-current':
-				send(res, 200, { stopped: app.scheduler.stopCurrentCard() });
+			case 'stop-current': {
+				// Optional cardId, so one lane can be stopped without touching the others.
+				const cardId = str(body['cardId']);
+				send(res, 200, { stopped: app.scheduler.stopCurrentCard(cardId) });
 				return;
+			}
 			case 'run-once': {
 				const outcome = await app.scheduler.runOnce();
 				send(res, 200, { outcome });
