@@ -456,3 +456,34 @@ test('statusFromText finds a bare status token in the final message', () => {
 	assert.equal(statusFromText('I am done with everything'), null, 'prose must not be mistaken for a status');
 	assert.equal(statusFromText(null), null);
 });
+
+test('a second attempt retires the worktree the first attempt left behind', async () => {
+	testEnv();
+	const worktree = fakeWorktree();
+	writeResult(worktree, 'run_super', { status: 'DONE' });
+
+	const orca = fakeOrca({
+		worktreePath: worktree,
+		psFrames: [[worktreeRow({ worktreeId: `repo::${worktree}`, path: worktree, agents: [agentRow('done')] })]],
+	});
+
+	const execute = createOrcaExecutor({
+		orca,
+		config: testConfig({ mirrorToOrcaBoard: true }),
+		orchestration: fakeOrchestration,
+		lookupCard: () => null,
+	});
+
+	// The card still carries the worktree of its previous, rejected attempt.
+	await execute(card({ worktreeId: 'repo::/tmp/first-attempt', attemptCount: 2 }), ctx('run_super').value);
+
+	assert.equal(
+		orca.columns["id:repo::/tmp/first-attempt"],
+		"superseded",
+		"the abandoned worktree must leave In Progress; an empty status would not move it",
+	);
+	assert.match(
+		orca.statusWrites.find((w) => w.selector === "id:repo::/tmp/first-attempt")?.comment ?? "",
+		/superseded by attempt 2/,
+	);
+});

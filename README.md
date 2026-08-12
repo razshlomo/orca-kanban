@@ -429,7 +429,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 108 tests
+npm test          # 109 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```
@@ -474,10 +474,15 @@ recovery. `scripts/smoke.ts` reproduces the same scenario against real OMP agent
     otherwise remap via `orcaStatusMap`.
 11. **A rejected card gets a *new* worktree, not its old one.** Orca de-duplicates the
     worktree name (`…-<cardId>-2`), so the second attempt starts from the base branch and
-    the previous attempt's uncommitted work stays behind in the first worktree. The agent
-    is not lost — it receives the previous summary and your reason in the prompt — but it
-    rebuilds rather than edits, and the old worktree remains until you remove it.
-12. **Agent artifacts must be committed to cross a card boundary.** A file written but not
+    the first attempt's uncommitted work stays behind. The agent is not flying blind — it
+    receives the previous summary and your reason in the prompt — but it rebuilds rather
+    than edits. The abandoned worktree is parked in a `superseded` column so it stops
+    looking like live work; its files are left alone for you to inspect or delete.
+12. **A workspace status cannot be cleared, only set.** `orca worktree set` takes
+    `--workspace-status <id>` and nothing that means "none", so retiring a card uses a
+    custom `superseded` id rather than an empty one. Passing an empty value silently
+    changes nothing.
+13. **Agent artifacts must be committed to cross a card boundary.** A file written but not
     committed is invisible to the next card, since each card gets a fresh worktree from
     the base branch.
 

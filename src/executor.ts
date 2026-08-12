@@ -42,6 +42,13 @@ export type ExecuteContext = {
 
 export type CardExecutor = (card: Card, ctx: ExecuteContext) => Promise<ExecutionResult>;
 
+/**
+ * Board column for a worktree an attempt abandoned. Orca cannot clear a status —
+ * `worktree set` only takes an id — but it accepts ids beyond its own defaults, so
+ * this parks superseded attempts outside "In Progress" without deleting their files.
+ */
+const SUPERSEDED_STATUS = 'superseded';
+
 /** Directory inside a worktree holding the prompt + result handshake files. */
 const CONTROL_DIR = GUARD_CONTROL_DIR;
 
@@ -220,6 +227,22 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 				branch = wt.branch.replace(/^refs\/heads\//, '') || null;
 				sessionId = wt.agentTerminalHandle ?? null;
 				createdWorktree = true;
+
+				// A rejected card gets a brand-new worktree (Orca de-duplicates the name), so
+				// the previous attempt's worktree would otherwise sit in Orca's "In Progress"
+				// column for ever. Orca has no way to clear a status, but it accepts arbitrary
+				// ids, so park the old one in `superseded`: out of the way, files still there.
+				if (card.worktreeId && card.worktreeId !== worktreeId) {
+					try {
+						await orca.worktreeSet({
+							selector: `id:${card.worktreeId}`,
+							workspaceStatus: SUPERSEDED_STATUS,
+							comment: `Kanban ${card.id}: superseded by attempt ${card.attemptCount}`,
+						});
+					} catch {
+						// Cosmetic only — never fail a card because an old worktree is gone.
+					}
+				}
 
 				// Keep the handshake dir out of git without touching a tracked .gitignore.
 				mkdirSync(path.join(worktreePath, CONTROL_DIR), { recursive: true });

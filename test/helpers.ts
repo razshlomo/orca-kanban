@@ -92,6 +92,13 @@ export type FakeOrca = OrcaApi & {
 	calls: string[];
 	psCallCount: number;
 	statusWrites: Array<{ selector: string; workspaceStatus: string | null; comment: string | null }>;
+	/**
+	 * The column each worktree is actually in. The real CLI omits
+	 * `--workspace-status` when the value is falsy, so an empty status is NOT a clear —
+	 * without modelling that, a test asserting on `statusWrites` passes on behaviour
+	 * the Orca CLI does not have.
+	 */
+	columns: Record<string, string>;
 };
 
 export function worktreeRow(over: Partial<OrcaWorktreeStatus> = {}): OrcaWorktreeStatus {
@@ -130,6 +137,7 @@ export function agentRow(state: string | null, over: Partial<OrcaWorktreeStatus[
 export function fakeOrca(options: FakeOrcaOptions = {}): FakeOrca {
 	const calls: string[] = [];
 	const statusWrites: FakeOrca['statusWrites'] = [];
+	const columns: FakeOrca['columns'] = {};
 	const frames = options.psFrames ?? [[worktreeRow({ agents: [agentRow('done')] })]];
 	const wtPath = options.worktreePath ?? '/tmp/fake';
 	let psIndex = 0;
@@ -137,6 +145,7 @@ export function fakeOrca(options: FakeOrcaOptions = {}): FakeOrca {
 	const api: FakeOrca = {
 		calls,
 		statusWrites,
+		columns,
 		psCallCount: 0,
 		async status() {
 			calls.push('status');
@@ -177,6 +186,9 @@ export function fakeOrca(options: FakeOrcaOptions = {}): FakeOrca {
 				workspaceStatus: opts.workspaceStatus ?? null,
 				comment: opts.comment ?? null,
 			});
+			// Mirrors OrcaCli.worktreeSet: a falsy status means the flag is never passed,
+			// so the worktree keeps whatever column it already had.
+			if (opts.workspaceStatus) columns[opts.selector] = opts.workspaceStatus;
 		},
 		async terminalCreate(opts): Promise<OrcaTerminal> {
 			calls.push(`terminalCreate:${opts.command ?? ''}`);
