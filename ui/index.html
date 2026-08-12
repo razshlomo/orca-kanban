@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Orca Kanban</title>
+		<style>
+			:root {
+				--bg: #0d0d0f;
+				--panel: #16161a;
+				--panel-2: #1c1c21;
+				--border: #2a2a31;
+				--text: #e6e6ea;
+				--muted: #8b8b96;
+				--accent: #4493f8;
+				--ok: #3fb950;
+				--warn: #d29922;
+				--bad: #f85149;
+				--radius: 8px;
+			}
+			* { box-sizing: border-box; }
+			body {
+				margin: 0;
+				background: var(--bg);
+				color: var(--text);
+				font: 13px/1.5 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif;
+			}
+			header {
+				display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+				padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--panel);
+				position: sticky; top: 0; z-index: 10;
+			}
+			h1 { font-size: 14px; margin: 0 12px 0 0; font-weight: 600; letter-spacing: .2px; }
+			button {
+				background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+				border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+			}
+			button:hover { border-color: #3a3a44; }
+			button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+			button.danger { color: var(--bad); }
+			.status { margin-left: auto; display: flex; gap: 14px; align-items: center; color: var(--muted); font-size: 12px; }
+			.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
+			.board { display: grid; grid-template-columns: repeat(6, minmax(190px, 1fr)); gap: 10px; padding: 12px; align-items: start; }
+			.col { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); min-height: 120px; }
+			.col > h2 {
+				font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
+				margin: 0; padding: 9px 10px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between;
+			}
+			.col.over { outline: 1px solid var(--accent); }
+			.cards { padding: 8px; display: flex; flex-direction: column; gap: 8px; min-height: 40px; }
+			.card {
+				background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+				padding: 8px; cursor: grab;
+			}
+			.card:hover { border-color: #3a3a44; }
+			.card.sel { border-color: var(--accent); }
+			.card .t { font-weight: 600; margin-bottom: 4px; word-break: break-word; }
+			.meta { display: flex; gap: 6px; flex-wrap: wrap; color: var(--muted); font-size: 11px; }
+			.tag { background: #22222a; border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
+			.tag.p { color: var(--accent); }
+			.tag.err { color: var(--bad); }
+			aside {
+				position: fixed; top: 0; right: 0; width: 400px; height: 100vh; overflow: auto;
+				background: var(--panel); border-left: 1px solid var(--border); padding: 14px; z-index: 20;
+			}
+			aside.hidden { display: none; }
+			label { display: block; font-size: 11px; color: var(--muted); margin: 8px 0 3px; }
+			input, textarea, select {
+				width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+				border-radius: 5px; padding: 6px; font: inherit;
+			}
+			textarea { min-height: 66px; resize: vertical; }
+			.row { display: flex; gap: 8px; }
+			.row > * { flex: 1; }
+			pre {
+				background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 8px;
+				white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; font-size: 11px; color: var(--muted);
+			}
+			.runs { font-size: 11px; }
+			.runs div { border-bottom: 1px solid var(--border); padding: 5px 0; }
+			.hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
+			.close { float: right; }
+		</style>
+	</head>
+	<body>
+		<header>
+			<h1>Orca Kanban</h1>
+			<button class="primary" id="start">Start auto-run</button>
+			<button id="pause">Pause</button>
+			<button id="after">Stop after current</button>
+			<button id="stopcur" class="danger">Stop current card</button>
+			<button id="once">Run one card</button>
+			<button id="recover">Recover</button>
+			<button id="new">+ Card</button>
+			<div class="status">
+				<span id="sstate"><span class="dot"></span>—</span>
+				<span id="scur"></span>
+				<span id="scount"></span>
+			</div>
+		</header>
+
+		<div class="board" id="board"></div>
+
+		<aside id="panel" class="hidden">
+			<button class="close" onclick="closePanel()">close</button>
+			<div id="panelBody"></div>
+		</aside>
+
+		<script>
+			const STATES = ['Backlog', 'Ready', 'In Progress', 'Review', 'Done', 'Blocked'];
+			let snapshot = { cards: [], scheduler: {}, config: {}, eligible: [] };
+			let selectedId = null;
+			let dragId = null;
+			let editing = false;
+
+			const api = async (url, method = 'GET', body) => {
+				const res = await fetch(url, {
+					method,
+					headers: body ? { 'content-type': 'application/json' } : undefined,
+					body: body ? JSON.stringify(body) : undefined,
+				});
+				if (!res.ok) {
+					const e = await res.json().catch(() => ({ error: res.statusText }));
+					throw new Error(e.error || 'request failed');
+				}
+				return res.json();
+			};
+
+			const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+			function render() {
+				const s = snapshot.scheduler || {};
+				const running = s.runState === 'running';
+				const color = running ? 'var(--ok)' : s.autoRun ? 'var(--warn)' : 'var(--muted)';
+				document.getElementById('sstate').innerHTML =
+					`<span class="dot" style="background:${color}"></span>${esc(s.runState || '—')}${s.autoRun ? ' · auto' : ''}`;
+				document.getElementById('scur').textContent = s.currentCardId
+					? `card ${s.currentCardId}${s.currentSessionId ? ' · ' + s.currentSessionId.slice(0, 18) : ''}`
+					: '';
+				document.getElementById('scount').textContent = `${s.cardsExecuted ?? 0} executed`;
+
+				const board = document.getElementById('board');
+				board.innerHTML = '';
+				for (const state of STATES) {
+					const cards = snapshot.cards.filter((c) => c.state === state).sort((a, b) => b.priority - a.priority || a.order - b.order);
+					const col = document.createElement('div');
+					col.className = 'col';
+					col.dataset.state = state;
+					col.innerHTML = `<h2><span>${esc(state)}</span><span>${cards.length}</span></h2><div class="cards"></div>`;
+					const list = col.querySelector('.cards');
+					for (const c of cards) list.appendChild(cardEl(c));
+
+					col.addEventListener('dragover', (e) => { e.preventDefault(); col.classList.add('over'); });
+					col.addEventListener('dragleave', () => col.classList.remove('over'));
+					col.addEventListener('drop', async (e) => {
+						e.preventDefault();
+						col.classList.remove('over');
+						if (!dragId) return;
+						await api(`/api/cards/${encodeURIComponent(dragId)}/move`, 'POST', { state });
+						dragId = null;
+						await refresh();
+					});
+					board.appendChild(col);
+				}
+				if (selectedId && !editing) renderPanel();
+			}
+
+			function cardEl(c) {
+				const el = document.createElement('div');
+				el.className = 'card' + (c.id === selectedId ? ' sel' : '');
+				el.draggable = true;
+				const eligible = (snapshot.eligible || []).includes(c.id);
+				el.innerHTML =
+					`<div class="t">${esc(c.title)}</div>
+					<div class="meta">
+						<span class="tag p">P${c.priority}</span>
+						${c.dependencies.length ? `<span class="tag">deps ${c.dependencies.length}</span>` : ''}
+						${c.attemptCount ? `<span class="tag">try ${c.attemptCount}/${c.maxAttempts}</span>` : ''}
+						${eligible ? '<span class="tag" style="color:var(--ok)">eligible</span>' : ''}
+						${c.lastResult ? `<span class="tag ${c.lastResult === 'DONE' ? '' : 'err'}">${esc(c.lastResult)}</span>` : ''}
+					</div>`;
+				el.addEventListener('dragstart', () => { dragId = c.id; });
+				el.addEventListener('click', () => { selectedId = c.id; editing = false; renderPanel(); });
+				return el;
+			}
+
+			async function renderPanel() {
+				const c = snapshot.cards.find((x) => x.id === selectedId);
+				if (!c) return closePanel();
+				const panel = document.getElementById('panel');
+				panel.classList.remove('hidden');
+				let runs = [];
+				try { runs = (await api(`/api/cards/${encodeURIComponent(c.id)}/runs`)).runs; } catch {}
+
+				document.getElementById('panelBody').innerHTML = `
+					<h2 style="font-size:13px;margin:0 0 2px">${esc(c.title)}</h2>
+					<div class="meta"><span class="tag">${esc(c.id)}</span><span class="tag">${esc(c.state)}</span></div>
+
+					<label>Title</label><input id="f-title" value="${esc(c.title)}" />
+					<label>Description</label><textarea id="f-desc">${esc(c.description)}</textarea>
+					<label>Acceptance criteria</label><textarea id="f-ac">${esc(c.acceptanceCriteria)}</textarea>
+					<div class="row">
+						<div><label>Priority</label><input id="f-prio" type="number" value="${c.priority}" /></div>
+						<div><label>Order</label><input id="f-order" type="number" value="${c.order}" /></div>
+						<div><label>Max attempts</label><input id="f-max" type="number" min="1" value="${c.maxAttempts}" /></div>
+					</div>
+					<div class="row">
+						<div><label>Repo (path or id:…)</label><input id="f-repo" value="${esc(c.repo ?? '')}" /></div>
+						<div><label>Agent</label><select id="f-agent">
+							<option value="">default (${esc(snapshot.config.defaultAgent)})</option>
+							${(snapshot.config.agents || []).map((a) => `<option ${c.agent === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}
+						</select></div>
+					</div>
+					<label>Dependencies (comma-separated card ids)</label>
+					<input id="f-deps" value="${esc(c.dependencies.join(','))}" />
+
+					<div class="row" style="margin-top:12px">
+						<button class="primary" onclick="saveCard()">Save</button>
+						<button onclick="retryCard()">Retry</button>
+						<button class="danger" onclick="deleteCard()">Delete</button>
+					</div>
+
+					${c.worktreePath ? `<label>Worktree</label><pre>${esc(c.worktreePath)}\n${esc(c.branch ?? '')}\n${esc(c.worktreeId ?? '')}</pre>` : ''}
+					${c.sessionId ? `<label>Orca session</label><pre>${esc(c.sessionId)}</pre>` : ''}
+					${c.commitSha ? `<label>Commit</label><pre>${esc(c.commitSha)}</pre>` : ''}
+					${c.lastAgentSummary ? `<label>Agent summary</label><pre>${esc(c.lastAgentSummary)}</pre>` : ''}
+					${c.lastError ? `<label>Last error</label><pre style="color:var(--bad)">${esc(c.lastError)}</pre>` : ''}
+
+					<label>Run history (${runs.length})</label>
+					<div class="runs">${
+						runs.map((r) => `<div><b>${esc(r.status)}</b> · ${new Date(r.startedAt).toLocaleString()}${r.commitSha ? ' · ' + esc(r.commitSha.slice(0, 8)) : ''}${r.error ? `<br><span style="color:var(--bad)">${esc(r.error)}</span>` : ''}</div>`).join('') || '<div class="hint">no runs yet</div>'
+					}</div>`;
+
+				for (const el of document.querySelectorAll('#panelBody input, #panelBody textarea, #panelBody select')) {
+					el.addEventListener('focus', () => { editing = true; });
+					el.addEventListener('blur', () => { editing = false; });
+				}
+			}
+
+			function closePanel() {
+				selectedId = null;
+				editing = false;
+				document.getElementById('panel').classList.add('hidden');
+			}
+
+			const val = (id) => document.getElementById(id).value;
+
+			async function saveCard() {
+				await api(`/api/cards/${encodeURIComponent(selectedId)}`, 'PATCH', {
+					title: val('f-title'),
+					description: val('f-desc'),
+					acceptanceCriteria: val('f-ac'),
+					priority: Number(val('f-prio')),
+					order: Number(val('f-order')),
+					maxAttempts: Number(val('f-max')),
+					repo: val('f-repo') || null,
+					agent: val('f-agent') || null,
+					dependencies: val('f-deps').split(',').map((s) => s.trim()).filter(Boolean),
+				});
+				editing = false;
+				await refresh();
+			}
+
+			async function retryCard() {
+				await api(`/api/cards/${encodeURIComponent(selectedId)}/retry`, 'POST', {});
+				await refresh();
+			}
+
+			async function deleteCard() {
+				if (!confirm('Delete this card?')) return;
+				await api(`/api/cards/${encodeURIComponent(selectedId)}`, 'DELETE');
+				closePanel();
+				await refresh();
+			}
+
+			document.getElementById('new').onclick = async () => {
+				const title = prompt('Card title');
+				if (!title) return;
+				const { card } = await api('/api/cards', 'POST', { title, state: 'Backlog' });
+				selectedId = card.id;
+				await refresh();
+			};
+
+			const ctl = (id, url, body) => {
+				document.getElementById(id).onclick = async () => {
+					try { await api(url, 'POST', body ?? {}); } catch (e) { alert(e.message); }
+					await refresh();
+				};
+			};
+			ctl('start', '/api/scheduler/start');
+			ctl('pause', '/api/scheduler/pause');
+			ctl('after', '/api/scheduler/stop-after-current');
+			ctl('stopcur', '/api/scheduler/stop-current');
+			ctl('once', '/api/scheduler/run-once');
+			ctl('recover', '/api/scheduler/recover');
+
+			async function refresh() {
+				try {
+					snapshot = await api('/api/state');
+					render();
+				} catch (e) {
+					document.getElementById('sstate').innerHTML = `<span class="dot" style="background:var(--bad)"></span>${esc(e.message)}`;
+				}
+			}
+
+			refresh();
+			setInterval(refresh, 1500);
+		</script>
+	</body>
+</html>

@@ -1,0 +1,23 @@
+{
+  "name": "orca-kanban",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Kanban-driven sequential agent execution for Orca ADE. The board is the source of truth.",
+  "bin": {
+    "orca-kanban": "./src/cli.ts"
+  },
+  "scripts": {
+    "start": "node src/cli.ts serve",
+    "run-scheduler": "node src/cli.ts run",
+    "test": "node --test --test-concurrency=1 test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.7.0"
+  }
+}

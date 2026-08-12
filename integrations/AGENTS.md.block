@@ -1,0 +1,22 @@
+<!-- BEGIN orca-kanban -->
+## Orca Kanban board
+
+When the user says "add to the kanban", "add a card", "kanban this", "put this on the
+board", "queue this", "break this into cards", or asks what is on the board, use the
+`kanban` CLI. Run `kanban help` for the full command list.
+
+- Add work: `kanban card add "<title>" --description "<detail>" --acceptance "<checkable outcome>"`
+- New cards default to **Backlog** (staging). Only use `--state Ready` when the user
+  asks to run it.
+- Several pieces of work → one card each, ordered with `--deps <id,id>`. Never one fat card.
+- Read the board: `kanban card list`, `kanban card show <id>`, `kanban status`.
+- Run it: `kanban run --once` (one card) or `kanban serve` (board UI + auto-run).
+- Fix stuck work: `kanban card retry <id>`, `kanban card move <id> <state>`, `kanban recover`.
+
+"Create a ticket" / "FR" / "Jira" means **Jira**, not this board.
+
+**If the current directory or any parent contains `.orca-kanban/card.json`, you are
+the agent executing that card.** Work only on that card and never modify the board;
+put follow-up work in your summary instead. The CLI refuses board writes there
+(exit code 3) — do not pass `--force` to bypass it.
+<!-- END orca-kanban -->

@@ -1,0 +1,235 @@
+/**
+ * Shared types for the Orca Kanban scheduler.
+ *
+ * Design note: no TS `enum`/`namespace`/parameter-properties anywhere in this
+ * project, because Node runs these .ts files with type-stripping only
+ * (no transformation). Const objects + union types instead.
+ */
+
+export const CARD_STATES = [
+  'Backlog',
+  'Ready',
+  'In Progress',
+  'Review',
+  'Done',
+  'Blocked',
+] as const;
+
+export type CardState = (typeof CARD_STATES)[number];
+
+export function isCardState(v: unknown): v is CardState {
+  return typeof v === 'string' && (CARD_STATES as readonly string[]).includes(v);
+}
+
+/** Status the agent reports for a single card attempt. */
+export const AGENT_STATUSES = ['DONE', 'BLOCKED', 'FAILED', 'NEEDS_REVIEW'] as const;
+export type AgentStatus = (typeof AGENT_STATUSES)[number];
+
+export function isAgentStatus(v: unknown): v is AgentStatus {
+  return typeof v === 'string' && (AGENT_STATUSES as readonly string[]).includes(v);
+}
+
+/** Terminal status of a CardRun row. */
+export type RunStatus = AgentStatus | 'INTERRUPTED' | 'TIMEOUT' | 'RUNNING';
+
+export type Card = {
+  id: string;
+  title: string;
+  description: string;
+  acceptanceCriteria: string;
+  state: CardState;
+  /** Higher wins. */
+  priority: number;
+  /** Lower wins; user-controlled ordering within a column. */
+  order: number;
+  dependencies: string[];
+  /** Orca repo selector or absolute path; falls back to config.defaultRepo. */
+  repo: string | null;
+  agent: string | null;
+  createdAt: number;
+  updatedAt: number;
+
+  claimedAt: number | null;
+  claimedBy: string | null;
+
+  sessionId: string | null;
+  branch: string | null;
+  worktreePath: string | null;
+  commitSha: string | null;
+  /** Orca worktree id (`<repoId>::<path>`) — this card's card on Orca's own board. */
+  worktreeId: string | null;
+  /** Orca orchestration Task/Dispatch ids, when provenance is enabled. */
+  orcaTaskId: string | null;
+  orcaDispatchId: string | null;
+
+  attemptCount: number;
+  maxAttempts: number;
+
+  lastResult: string | null;
+  lastError: string | null;
+  lastAgentSummary: string | null;
+};
+
+export type CardInput = {
+  title: string;
+  description?: string;
+  acceptanceCriteria?: string;
+  state?: CardState;
+  priority?: number;
+  order?: number;
+  dependencies?: string[];
+  repo?: string | null;
+  agent?: string | null;
+  maxAttempts?: number;
+  id?: string;
+};
+
+export type CardRun = {
+  id: string;
+  cardId: string;
+  sessionId: string | null;
+  startedAt: number;
+  finishedAt: number | null;
+  status: RunStatus;
+  commitSha: string | null;
+  summary: string | null;
+  error: string | null;
+  /** Free-form JSON blob: tests, lint, files changed, raw agent tail. */
+  details: string | null;
+};
+
+/** What the agent wrote to its result file, if anything. */
+export type AgentResultFile = {
+  status: AgentStatus;
+  summary?: string;
+  filesChanged?: string[];
+  testsRun?: string[];
+  lint?: string;
+  typecheck?: string;
+  concerns?: string;
+};
+
+/** Everything the executor collected for one attempt. */
+export type ExecutionResult = {
+  status: AgentStatus | 'TIMEOUT';
+  /**
+   * How the executor learned the agent had finished.
+   *   agent-done   - Orca reported agents[].state === 'done' (native, preferred)
+   *   result-file  - the agent's result JSON appeared and parsed
+   *   interrupted  - Orca reported the agent was interrupted
+   *   gone         - the worktree/agent vanished from Orca
+   *   timeout      - cardTimeoutMs elapsed
+   *   stopped      - operator aborted the card
+   */
+  completionReason: 'agent-done' | 'result-file' | 'interrupted' | 'gone' | 'timeout' | 'stopped';
+  sessionId: string | null;
+  runId: string;
+  branch: string | null;
+  worktreePath: string | null;
+  worktreeId: string | null;
+  commitSha: string | null;
+  summary: string | null;
+  error: string | null;
+  /** Orca's own `lastAssistantMessage` for the agent — the final response. */
+  agentResponse: string | null;
+  filesChanged: string[];
+  testsRun: string[];
+  lint: string | null;
+  typecheck: string | null;
+  concerns: string | null;
+  startedAt: number;
+  finishedAt: number;
+};
+
+export type AgentConfig = {
+  /**
+   * Orca's own agent id, passed to `orca worktree create --agent <id>`.
+   * Orca ships support for omp (oh-my-pi), claude, codex, cursor, grok, opencode,
+   * pi, droid and more, so the prompt is delivered by Orca itself.
+   */
+  orcaAgentId: string;
+  /**
+   * Fallback only, for an agent this Orca build does not know: the shell command
+   * used with `terminal create --command`. `{{promptFile}}` / `{{promptFileRel}}`
+   * / `{{prompt}}` are substituted.
+   */
+  fallbackCommand: string | null;
+};
+
+export type KanbanConfig = {
+  enabled: boolean;
+  autoRun: boolean;
+  pollIntervalMs: number;
+  defaultAgent: string;
+  maxAttempts: number;
+  /** Where a successful card lands. */
+  successState: 'Review' | 'Done';
+  /** Orca repo selector or path used when a card does not name one. */
+  defaultRepo: string | null;
+  /** Base ref for each card's worktree; null uses the repo default. */
+  baseBranch: string | null;
+  /** Repo setup-hook policy for created worktrees. */
+  setupPolicy: 'run' | 'skip' | 'inherit';
+  /** Remove the Orca worktree after a card completes successfully. */
+  removeWorktreeOnSuccess: boolean;
+  /** Close the card's Orca agent terminal once the card settles. */
+  closeSessionWhenDone: boolean;
+  /**
+   * Mirror card state onto the Orca worktree's workspaceStatus so each card shows
+   * up in the correct column of Orca's own workspace board.
+   */
+  mirrorToOrcaBoard: boolean;
+  /** Card state -> Orca workspaceStatus id. */
+  orcaStatusMap: Record<CardState, string>;
+  /** Ignore Orca's agent state until the agent has had time to register. */
+  startupGraceMs: number;
+  /** How often to sample Orca's native agent state. */
+  agentPollIntervalMs: number;
+  /** Consecutive `done` samples required before a card is settled. */
+  doneConfirmations: number;
+  /** Hard ceiling for one card attempt. */
+  cardTimeoutMs: number;
+  /** Identity used when claiming cards. */
+  workerId: string;
+  /** HTTP port for the board API + UI. */
+  port: number;
+  /** Recovery policy for cards found stranded in "In Progress". */
+  recoveryPolicy: 'ready' | 'blocked';
+  /** Register each card run as an Orca orchestration Task + Dispatch. */
+  orchestration: {
+    enabled: boolean;
+    objective: string;
+    runId: string | null;
+  };
+  agents: Record<string, AgentConfig>;
+};
+
+export type SchedulerRunState = 'stopped' | 'idle' | 'running' | 'paused' | 'stopping';
+
+export type SchedulerStatus = {
+  runState: SchedulerRunState;
+  autoRun: boolean;
+  currentCardId: string | null;
+  currentRunId: string | null;
+  currentSessionId: string | null;
+  startedAt: number | null;
+  lastCardFinishedAt: number | null;
+  cardsExecuted: number;
+  stopAfterCurrent: boolean;
+};
+
+export type BoardEvent =
+  | 'card_selected'
+  | 'card_claimed'
+  | 'session_started'
+  | 'agent_started'
+  | 'agent_idle'
+  | 'card_completed'
+  | 'card_blocked'
+  | 'card_failed'
+  | 'retry_scheduled'
+  | 'scheduler_idle'
+  | 'card_recovered'
+  | 'session_closed'
+  | 'board_changed'
+  | 'scheduler_state';

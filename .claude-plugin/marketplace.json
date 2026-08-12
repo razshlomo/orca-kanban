@@ -1,0 +1,27 @@
+{
+  "name": "orca-kanban",
+  "owner": {
+    "name": "Raz Shlomo",
+    "url": "https://github.com/razshlomo"
+  },
+  "metadata": {
+    "description": "Kanban-driven sequential agent execution for Orca ADE. One card, one agent session, one worktree.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "orca-kanban",
+      "source": "./",
+      "description": "Put work on the Orca Kanban board and let agents execute it one card at a time. Adds the orca-kanban skill for adding, ordering, running, and recovering cards.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Raz Shlomo",
+        "url": "https://github.com/razshlomo"
+      },
+      "homepage": "https://github.com/razshlomo/orca-kandan",
+      "repository": "https://github.com/razshlomo/orca-kandan",
+      "license": "MIT",
+      "keywords": ["orca", "kanban", "agents", "scheduler", "worktree", "omp", "codex"]
+    }
+  ]
+}

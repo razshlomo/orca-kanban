@@ -1,0 +1,15 @@
+node_modules/
+
+# Local board state and history — never publish these.
+config.json
+board.sqlite
+board.sqlite-shm
+board.sqlite-wal
+runs/
+scheduler.log
+*.log
+
+# Agent handshake dir, when the repo itself is used as a card worktree.
+.orca-kanban/
+
+.DS_Store
