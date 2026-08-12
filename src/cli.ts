@@ -320,6 +320,15 @@ async function main(): Promise<number> {
 	return 1;
 }
 
+// `kanban card show | head` closes the pipe while we are still writing. That is a
+// normal way to use a CLI, not a crash, so exit quietly instead of throwing EPIPE.
+for (const stream of [process.stdout, process.stderr]) {
+	stream.on('error', (err: NodeJS.ErrnoException) => {
+		if (err.code === 'EPIPE') process.exit(0);
+		throw err;
+	});
+}
+
 main()
 	.then((code) => {
 		if (code !== 0) process.exitCode = code;
