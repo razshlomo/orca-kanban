@@ -3,7 +3,9 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gitReviewDiff } from './git.ts';
+import { landCardWork } from './land.ts';
 import { parseDueAt } from './text.ts';
+import { BoardRuleError } from './board.ts';
 import type { App } from './app.ts';
 import { isCardState, type Card, type CardInput, type CardState } from './types.ts';
 
@@ -106,7 +108,14 @@ function stateSnapshot(app: App): Record<string, unknown> {
 export function createHttpServer(app: App): Server {
 	return createServer((req, res) => {
 		void handle(app, req, res).catch((err: Error) => {
-			if (!res.headersSent) send(res, 500, { error: err.message });
+			if (res.headersSent) return;
+			// A refused transition is the caller asking for something the board's rules
+			// forbid — a 409 with the reason, not an opaque 500.
+			if (err instanceof BoardRuleError) {
+				send(res, 409, { error: err.message, cardId: err.cardId, state: err.state });
+				return;
+			}
+			send(res, 500, { error: err.message });
 		});
 	});
 }
@@ -209,12 +218,21 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 		if (action === '/approve' && method === 'POST') {
 			const body = await readBody(req);
 			const state = body['state'];
+
+			// Validate before touching the repository: a refused approval must not commit.
+			const target = app.board.verdictTarget(id);
+			if (!target) return send(res, 404, { error: `no such card ${id}` });
+
+			// Then land the work, so Done never means "finished, changes lost".
+			const landing = await landCardWork(target, app.config);
+			if (landing.committed) app.board.recordCommit(card.id, landing.sha);
+
 			const approved = app.board.approveCard(id, {
 				...(str(body['comment']) ? { comment: String(body['comment']) } : {}),
 				...(isCardState(state) ? { state } : {}),
 			});
 			if (approved) await app.mirrorCard(approved, 'approved by review');
-			send(res, 200, { card: approved });
+			send(res, 200, { card: approved, landing });
 			return;
 		}
 
@@ -306,8 +324,15 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 				return;
 			}
 			case 'run-once': {
+				// Saying "no slot" beats silently doing nothing and looking broken.
+				const busy = app.board.inFlightCount();
+				if (busy >= app.config.maxConcurrent) {
+					return send(res, 409, {
+						error: `All ${app.config.maxConcurrent} slot${app.config.maxConcurrent === 1 ? '' : 's'} are busy (${busy} in flight).`,
+					});
+				}
 				const outcome = await app.scheduler.runOnce();
-				send(res, 200, { outcome });
+				send(res, 200, { outcome, eligible: app.board.eligibleCards().length });
 				return;
 			}
 			case 'recover': {

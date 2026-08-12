@@ -48,6 +48,7 @@ export const DEFAULT_CONFIG: KanbanConfig = {
 	defaultAgent: 'omp',
 	maxAttempts: 2,
 	successState: 'Review',
+	landOnApprove: 'commit',
 	defaultRepo: null,
 	baseBranch: null,
 	setupPolicy: 'inherit',

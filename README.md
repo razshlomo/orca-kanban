@@ -285,9 +285,39 @@ kanban card comment <id> "a question that is not a verdict"
 
 | Action | Card goes to | Effect |
 | --- | --- | --- |
-| `approve` | Done | Verdict recorded in the review trail. |
+| `approve` | Done | **Commits the work on the card branch**, records the sha, files the verdict. |
 | `reject` | Ready | Retry budget restored, **and your reason is injected into the next agent's prompt**. |
 | `comment` | unchanged | A note on the trail; the next agent reads it too. |
+
+### Approving lands the work
+
+Agents do not commit, so their changes are usually loose files in a worktree. Approving
+therefore **commits them on the card's own branch** and stores the sha on the card —
+otherwise the board reads Done while the repository has nothing, which is exactly what
+happened before this existed. Merging into the base branch stays yours (a merge, a PR, a
+cherry-pick), because that is the step that can break somebody else's build.
+
+```json
+{ "landOnApprove": "commit" }
+```
+
+Set it to `"off"` to leave the worktree untouched. The commit message carries the card
+title, the agent's own summary, and the card id. The card panel warns while work is
+uncommitted, and shows the short sha once it is landed.
+
+### The board refuses what makes no sense
+
+Validation lives in the board, so the CLI, the API and the UI all get it:
+
+| Action | Allowed when | Otherwise |
+| --- | --- | --- |
+| `approve` / `reject` | card is **Review** or **Blocked** | 409, exit 4 — a card with no result has nothing to judge |
+| `delete` / `retry` / `snooze` | card is not **In Progress** | 409 — stop the card first, or `--force` to delete anyway |
+| `run-once` | a slot is free | 409 naming how many are busy |
+
+A refused verdict is checked **before** anything is committed, so a rejected approval
+cannot leave a commit behind. In the UI every button that cannot apply is disabled with the
+reason as its tooltip, rather than failing when pressed.
 
 A rejection **requires** a reason, and refuses without one. That reason is the whole
 mechanism: a rejected card gets a brand-new agent session with no memory, so the words
@@ -531,7 +561,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 131 tests
+npm test          # 147 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```

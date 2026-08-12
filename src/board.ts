@@ -27,6 +27,24 @@ function rowToComment(row: Row): CardComment {
 	};
 }
 
+/**
+ * A refused board action: the card exists, but this move makes no sense for the state
+ * it is in. Separate from "no such card" (null) so callers can answer 409 vs 404.
+ */
+export class BoardRuleError extends Error {
+	readonly cardId: string;
+	readonly state: CardState;
+
+	constructor(message: string, cardId: string, state: CardState) {
+		super(message);
+		this.name = 'BoardRuleError';
+		this.cardId = cardId;
+		this.state = state;
+	}
+}
+
+/** States a human verdict can be applied to: the card has run, or has given up. */
+const REVIEWABLE: readonly CardState[] = ['Review', 'Blocked'];
 /** Tolerates a missing or malformed column: an unreadable slot list is not a crash. */
 function parseInFlight(raw: unknown): SchedulerStatus['inFlight'] {
 	if (typeof raw !== 'string' || raw === '') return [];
@@ -311,7 +329,44 @@ export class Board extends EventEmitter {
 		return this.getCard(id);
 	}
 
-	deleteCard(id: string): boolean {
+	/** A live agent owns this card; changing it underneath would orphan the run. */
+	private refuseWhileRunning(card: Card, action: string): void {
+		if (card.state !== 'In Progress') return;
+		throw new BoardRuleError(
+			`Cannot ${action} while it is running. Stop the card first, or move it out of In Progress.`,
+			card.id,
+			card.state,
+		);
+	}
+
+	/** A verdict only means something once the card has produced an outcome. */
+	private refuseUnlessReviewable(card: Card, action: string): void {
+		if (REVIEWABLE.includes(card.state)) return;
+		throw new BoardRuleError(
+			`Cannot ${action} a card in ${card.state}; only ${REVIEWABLE.join(' or ')} cards carry a result to judge.`,
+			card.id,
+			card.state,
+		);
+	}
+
+	/**
+	 * The card a verdict is about to be applied to, validated but untouched.
+	 *
+	 * Callers that do work before the verdict — committing the card's changes — must
+	 * check first, or a refused approval still mutates the repository.
+	 */
+	verdictTarget(id: string): Card | null {
+		const card = this.getCard(id);
+		if (!card) return null;
+		this.refuseUnlessReviewable(card, 'approve or request changes on');
+		return card;
+	}
+
+	deleteCard(id: string, options: { force?: boolean } = {}): boolean {
+		const existing = this.getCard(id);
+		// Deleting a running card orphans its agent and worktree; make it deliberate.
+		if (existing && !options.force) this.refuseWhileRunning(existing, 'delete a card');
+
 		const changes = Number(this.db.prepare('DELETE FROM cards WHERE id = ?').run(id).changes);
 		if (changes > 0) this.touched('card_deleted', id);
 		return changes > 0;
@@ -370,6 +425,8 @@ export class Board extends EventEmitter {
 	snoozeCard(id: string, dueAt: number, options: { state?: CardState } = {}): Card | null {
 		const existing = this.getCard(id);
 		if (!existing) return null;
+		// Deferring a running card would drop the claim under a live agent.
+		this.refuseWhileRunning(existing, 'hold a card');
 
 		// A card parked in any other column would never wake by itself, so a snooze puts
 		// it in Ready and lets `not_before` hold it there until it is due.
@@ -402,6 +459,7 @@ export class Board extends EventEmitter {
 	retryCard(id: string, options: { resetAttempts?: boolean } = {}): Card | null {
 		const card = this.getCard(id);
 		if (!card) return null;
+		this.refuseWhileRunning(card, 'retry a card');
 
 		const resetAttempts = options.resetAttempts ?? true;
 		this.db
@@ -462,6 +520,7 @@ export class Board extends EventEmitter {
 	approveCard(id: string, options: { comment?: string; state?: CardState; author?: string } = {}): Card | null {
 		const card = this.getCard(id);
 		if (!card) return null;
+		this.refuseUnlessReviewable(card, 'approve');
 
 		this.addComment(id, options.comment?.trim() || 'Approved.', { kind: 'approved', author: options.author ?? 'human' });
 		return this.moveCard(id, options.state ?? 'Done');
@@ -475,6 +534,7 @@ export class Board extends EventEmitter {
 	rejectCard(id: string, feedback: string, options: { author?: string; state?: CardState } = {}): Card | null {
 		const card = this.getCard(id);
 		if (!card) return null;
+		this.refuseUnlessReviewable(card, 'request changes on');
 
 		const reason = feedback.trim();
 		if (!reason) throw new Error('a rejection needs a reason — that reason is what the next agent reads');
@@ -573,6 +633,17 @@ export class Board extends EventEmitter {
 				id,
 			);
 		this.touched('session_attached', id);
+	}
+
+	/**
+	 * Records the commit an approval produced, so the card points at the work rather
+	 * than merely claiming to be finished.
+	 */
+	recordCommit(id: string, sha: string): Card | null {
+		if (!this.getCard(id)) return null;
+		this.db.prepare('UPDATE cards SET commit_sha = ?, updated_at = ? WHERE id = ?').run(sha, Date.now(), id);
+		this.touched('card_committed', id);
+		return this.getCard(id);
 	}
 
 	/**

@@ -10,6 +10,7 @@
 
   "maxAttempts": 2,
   "successState": "Review",
+  "landOnApprove": "commit",
 
   "baseBranch": null,
   "setupPolicy": "inherit",

@@ -430,3 +430,89 @@ test('opening the session switches Orca to that terminal, and 400s when there is
 		await h.stop();
 	}
 });
+
+type LandingResponse = { card: Card; landing: { committed: boolean; reason?: string } };
+type StoppedResponse = { stopped: boolean };
+
+test('a verdict on a card with no result is a 409 that explains itself', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = h.app.board.createCard({ title: 'not reviewable', state: 'Backlog' });
+
+		for (const route of ['approve', 'reject']) {
+			const res = await h.call<ErrorResponse & { state: string }>(`/api/cards/${card.id}/${route}`, 'POST', {
+				comment: 'anything',
+			});
+			assert.equal(res.status, 409, `${route} must be refused, not accepted or 500`);
+			assert.match(res.json.error, /only Review or Blocked/);
+			assert.equal(res.json.state, 'Backlog', 'the response names the state that blocked it');
+		}
+		assert.equal(h.app.board.getCard(card.id)?.state, 'Backlog', 'the card never moved');
+	} finally {
+		await h.stop();
+	}
+});
+
+test('destructive actions on a running card are 409, not silent damage', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = h.app.board.createCard({ title: 'busy', state: 'Ready' });
+		h.app.board.claimCard(card.id, 'worker-1');
+
+		for (const [route, method, body] of [
+			[`/api/cards/${card.id}`, 'DELETE', undefined],
+			[`/api/cards/${card.id}/retry`, 'POST', {}],
+			[`/api/cards/${card.id}/snooze`, 'POST', { until: '1d' }],
+		] as const) {
+			const res = await h.call<ErrorResponse>(route, method, body);
+			assert.equal(res.status, 409, `${method} ${route} must be refused`);
+			assert.match(res.json.error, /while it is running/);
+		}
+		assert.ok(h.app.board.getCard(card.id), 'the running card is intact');
+	} finally {
+		await h.stop();
+	}
+});
+
+test('approving reports what it landed, even when there was nothing to land', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = withWorktree(h.app, h.app.board.createCard({ title: 'x', state: 'Review' }));
+
+		const res = await h.call<LandingResponse>(`/api/cards/${card.id}/approve`, 'POST', { comment: 'ok' });
+		assert.equal(res.status, 200);
+		assert.equal(res.json.card.state, 'Done');
+		// /tmp/wt is not a git repo, so landing reports a failure rather than pretending.
+		assert.equal(res.json.landing.committed, false);
+		assert.ok(res.json.landing.reason, 'the reason is always stated');
+	} finally {
+		await h.stop();
+	}
+});
+
+test('run-once refuses when every slot is already busy', async () => {
+	const h = await mirrorHarness();
+	try {
+		const busy = h.app.board.createCard({ title: 'busy', state: 'Ready' });
+		h.app.board.claimCard(busy.id, 'worker-1');
+		h.app.board.createCard({ title: 'waiting', state: 'Ready' });
+
+		const res = await h.call<ErrorResponse>('/api/scheduler/run-once', 'POST', {});
+		assert.equal(res.status, 409, 'a full board says so instead of doing nothing');
+		assert.match(res.json.error, /slot/);
+	} finally {
+		await h.stop();
+	}
+});
+
+test('stopping a card that is not in flight reports false rather than pretending', async () => {
+	const h = await mirrorHarness();
+	try {
+		const card = h.app.board.createCard({ title: 'idle', state: 'Ready' });
+		const res = await h.call<StoppedResponse>('/api/scheduler/stop-current', 'POST', { cardId: card.id });
+		assert.equal(res.status, 200);
+		assert.equal(res.json.stopped, false);
+	} finally {
+		await h.stop();
+	}
+});

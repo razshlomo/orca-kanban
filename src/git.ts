@@ -128,3 +128,43 @@ export async function gitReviewDiff(
 		truncated,
 	};
 }
+
+export type CommitOutcome =
+	| { committed: true; sha: string; files: number }
+	| { committed: false; reason: 'nothing-to-commit' | 'failed'; error?: string };
+
+/**
+ * Commits everything in a card's worktree, including files the agent never staged.
+ *
+ * Agents do not commit by default, so approving a card would otherwise leave the
+ * work as loose files in a worktree — the card reads Done while the repository has
+ * nothing. Committing on the card's own branch preserves the work without touching
+ * the base branch, which stays a human decision (merge, PR, or cherry-pick).
+ */
+export async function gitCommitAll(cwd: string, message: string): Promise<CommitOutcome> {
+	const status = await run(cwd, ['status', '--porcelain', '--untracked-files=all']);
+	if (status === null) return { committed: false, reason: 'failed', error: 'git status failed' };
+
+	const files = status.split('\n').filter((line) => line.trim() !== '').length;
+	if (files === 0) return { committed: false, reason: 'nothing-to-commit' };
+
+	if ((await run(cwd, ['add', '-A'])) === null) {
+		return { committed: false, reason: 'failed', error: 'git add failed' };
+	}
+
+	// -c keeps this out of the user's global identity if the repo has none set.
+	const committed = await run(cwd, [
+		'-c',
+		'user.name=orca-kanban',
+		'-c',
+		'user.email=orca-kanban@local',
+		'commit',
+		'--no-verify',
+		'-m',
+		message,
+	]);
+	if (committed === null) return { committed: false, reason: 'failed', error: 'git commit failed' };
+
+	const sha = await run(cwd, ['rev-parse', 'HEAD']);
+	return sha ? { committed: true, sha, files } : { committed: false, reason: 'failed', error: 'could not read HEAD' };
+}

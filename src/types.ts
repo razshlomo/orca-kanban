@@ -209,6 +209,14 @@ export type KanbanConfig = {
   maxAttempts: number;
   /** Where a successful card lands. */
   successState: 'Review' | 'Done';
+  /**
+   * What approving a card does with the work sitting in its worktree.
+   *
+   * Agents do not commit, so `off` leaves an approved card reading Done while the
+   * repository has nothing — the work is loose files. `commit` puts it on the card's
+   * own branch, which is preserved and reviewable without touching the base branch.
+   */
+  landOnApprove: 'commit' | 'off';
   /** Orca repo selector or path used when a card does not name one. */
   defaultRepo: string | null;
   /** Base ref for each card's worktree; null uses the repo default. */

@@ -24,7 +24,7 @@ const promptFor = (board: Board, id: string): string => {
 
 test('the review trail is append-only and keeps the order it was written in', () => {
 	const { board } = testBoard();
-	const card = board.createCard({ title: 'x' });
+	const card = board.createCard({ title: 'x', state: 'Review' });
 
 	board.addComment(card.id, 'first');
 	board.addComment(card.id, 'second');

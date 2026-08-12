@@ -146,6 +146,16 @@
 					: [Math.round(abs / 1000), 's'];
 				return d >= 0 ? `in ${n}${u}` : `${n}${u} ago`;
 			};
+			/**
+			 * Enables or disables a control and says why. A button you can always press
+			 * but that sometimes does nothing is worse than one that tells you the reason.
+			 */
+			function gate(id, allowed, whyNot) {
+				const el = document.getElementById(id);
+				if (!el) return;
+				el.disabled = !allowed;
+				el.title = allowed ? '' : whyNot;
+			}
 
 			// The panel re-renders on every poll, so a fetched diff is cached here or it
 			// would vanish a second after you asked for it.
@@ -176,6 +186,21 @@
 				toggle.title = s.autoRun
 					? 'Auto-run is on: eligible cards are picked up automatically'
 					: 'Auto-run is off: nothing runs until you start it';
+				// Every control below is only meaningful in some states. Disable the rest
+				// with a reason, rather than letting a click fail or quietly do nothing.
+				const inFlightCount = s.inFlightCount ?? lanes.length;
+				const slotsFree = (s.maxConcurrent ?? 1) - inFlightCount;
+				const eligible = (snapshot.eligible || []).length;
+				const stranded = snapshot.cards.filter((c) => c.state === 'In Progress').length;
+
+				gate('after', s.autoRun && inFlightCount > 0, 'Only while auto-run is on with a card running');
+				gate('stopcur', inFlightCount > 0, 'Nothing is running');
+				gate(
+					'once',
+					slotsFree > 0 && eligible > 0,
+					slotsFree <= 0 ? `All ${s.maxConcurrent} slots are busy` : 'No card is eligible right now',
+				);
+				gate('recover', stranded > 0, 'No card is stranded In Progress');
 
 				const board = document.getElementById('board');
 				board.innerHTML = '';
@@ -232,6 +257,34 @@
 				panel.classList.remove('hidden');
 				let runs = [];
 				let comments = [];
+
+				// One place that decides what this card allows, mirroring the board's own
+				// rules so the UI never offers something the API will refuse.
+				//
+				// `running` comes from the card's STATE, not this scheduler's lanes: a card
+				// executed by another daemon is In Progress here too, and the board refuses
+				// to touch it either way. Stopping, though, only works for our own lanes.
+				const running = c.state === 'In Progress';
+				const stoppable = inFlightIds.includes(c.id);
+				const reviewable = c.state === 'Review' || c.state === 'Blocked';
+				const can = {
+					retry: !running && (c.state === 'Blocked' || c.attemptCount > 0),
+					destroy: !running,
+					verdict: reviewable,
+					hold: !running,
+					openChanges: Boolean(c.worktreePath),
+					openSession: running && Boolean(c.sessionId),
+					clearHold: Boolean(c.notBefore),
+				};
+				const why = {
+					retry: running ? 'Stop the card first' : 'Nothing has been attempted yet',
+					destroy: 'Stop the card before deleting it',
+					verdict: `A card in ${c.state} has no result to judge — only Review or Blocked`,
+					hold: 'Stop the card first',
+					openChanges: 'This card has never run, so there are no changes',
+					openSession: c.sessionId ? 'The session is closed; open the changes instead' : 'This card has no session',
+					clearHold: 'This card is not on hold',
+				};
 				try { runs = (await api(`/api/cards/${encodeURIComponent(c.id)}/runs`)).runs; } catch {}
 				try { comments = (await api(`/api/cards/${encodeURIComponent(c.id)}/comments`)).comments; } catch {}
 
@@ -259,8 +312,8 @@
 
 					<div class="row" style="margin-top:12px">
 						<button class="primary" onclick="saveCard()">Save</button>
-						<button onclick="retryCard()">Retry</button>
-						<button class="danger" onclick="deleteCard()">Delete</button>
+						<button ${can.retry ? '' : `disabled title="${esc(why.retry)}"`} onclick="retryCard()">Retry</button>
+						<button class="danger" ${can.destroy ? '' : `disabled title="${esc(why.destroy)}"`} onclick="deleteCard()">Delete</button>
 					</div>
 
 					<div class="review">
@@ -276,31 +329,32 @@
 							</div>
 						</div>
 						<div class="row" style="margin-top:6px">
-							<button onclick="snoozeCard()">Hold</button>
+							<button ${can.hold ? '' : `disabled title="${esc(why.hold)}"`} onclick="snoozeCard()">Hold</button>
 							<button onclick="saveRepeat()">Save repeat</button>
-							<button ${c.notBefore ? '' : 'disabled'} onclick="clearSchedule()">Clear</button>
+							<button ${can.clearHold ? '' : `disabled title="${esc(why.clearHold)}"`} onclick="clearSchedule()">Clear</button>
 						</div>
 						${c.notBefore ? `<div class="hint">Held until ${new Date(c.notBefore).toLocaleString()} (${rel(c.notBefore)}).</div>` : ''}
-						${inFlightIds.includes(c.id) ? '<button class="danger" style="margin-top:8px" onclick="stopThisCard()">Stop this card now</button>' : ''}
+						${stoppable ? '<button class="danger" style="margin-top:8px" onclick="stopThisCard()">Stop this card now</button>' : running ? '<div class="hint">Running under another scheduler, so it cannot be stopped from here.</div>' : ''}
 					</div>
 
 					<div class="review">
 						<label>Review — what the agent produced</label>
 						<div class="row">
-							<button ${c.worktreePath ? '' : 'disabled'} onclick="openInOrca('changes')">Open changes in Orca</button>
-							<button ${c.sessionId ? '' : 'disabled'} onclick="openInOrca('session')">Open session</button>
+							<button ${can.openChanges ? '' : `disabled title="${esc(why.openChanges)}"`} onclick="openInOrca('changes')">Open changes in Orca</button>
+							<button ${can.openSession ? '' : `disabled title="${esc(why.openSession)}"`} onclick="openInOrca('session')">Open session</button>
 						</div>
-						${c.worktreePath ? `<button style="margin-top:6px" onclick="loadDiff()">${diffCache.cardId === c.id ? 'Reload' : 'Show'} changes here</button>` : '<div class="hint">No worktree yet — this card has not run.</div>'}
+						${can.openChanges ? `<button style="margin-top:6px" onclick="loadDiff()">${diffCache.cardId === c.id ? 'Reload' : 'Show'} changes here</button>` : '<div class="hint">No worktree yet — this card has not run.</div>'}
 						${diffCache.cardId === c.id ? `<pre style="max-height:320px;color:var(--text)">${esc(diffCache.text)}</pre>` : ''}
+						${c.commitSha ? `<div class="hint">Work committed as <code>${esc(c.commitSha.slice(0, 8))}</code>.</div>` : can.openChanges ? '<div class="hint" style="color:var(--warn)">Not committed yet — approving will commit it on this card\u2019s branch.</div>' : ''}
 
 						<label>Comment / reason</label>
 						<textarea id="f-comment" placeholder="What must change, or why this is good"></textarea>
 						<div class="row">
-							<button class="ok" onclick="approveCard()">Approve → Done</button>
-							<button class="danger" onclick="rejectCard()">Request changes → Ready</button>
+							<button class="ok" ${can.verdict ? '' : `disabled title="${esc(why.verdict)}"`} onclick="approveCard()">Approve → Done</button>
+							<button class="danger" ${can.verdict ? '' : `disabled title="${esc(why.verdict)}"`} onclick="rejectCard()">Request changes → Ready</button>
 						</div>
 						<button style="margin-top:6px" onclick="addComment()">Comment only</button>
-						<div class="hint">A rejection reason is sent to the next agent that picks this card up.</div>
+						<div class="hint">Approving commits the work on this card's branch, then moves it to Done. A rejection reason is sent to the next agent that picks the card up.</div>
 
 						<label>Review trail (${comments.length})</label>
 						<div class="trail">${

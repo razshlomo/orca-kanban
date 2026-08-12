@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { createApp } from './app.ts';
+import { BoardRuleError } from './board.ts';
 import { gitReviewDiff } from './git.ts';
+import { describeLanding, landCardWork } from './land.ts';
 import { formatRelative, parseDueAt, parseDuration } from './text.ts';
 import { assertBoardWritable, CardWorkerGuardError } from './guard.ts';
 import { createHttpServer } from './server.ts';
@@ -255,7 +257,8 @@ async function main(): Promise<number> {
 			if (sub === 'rm') {
 				const id = args._[2];
 				if (!id) throw new Error('a card id is required');
-				process.stdout.write(app.board.deleteCard(id) ? `deleted ${id}\n` : `no such card ${id}\n`);
+				const force = args.flags['force'] === true;
+				process.stdout.write(app.board.deleteCard(id, { force }) ? `deleted ${id}\n` : `no such card ${id}\n`);
 				return 0;
 			}
 
@@ -272,11 +275,19 @@ async function main(): Promise<number> {
 			if (sub === 'approve') {
 				const id = args._[2];
 				if (!id) throw new Error('a card id is required');
+				// Validate FIRST: a refused approval must not commit anything.
+				const existing = app.board.verdictTarget(id);
+				if (!existing) throw new Error(`no such card ${id}`);
+
+				// Then commit, so "Done" never means "finished, files lost".
+				const landing = await landCardWork(existing, app.config);
+				if (landing.committed) app.board.recordCommit(id, landing.sha);
+
 				const comment = flagStr(args, 'm') ?? flagStr(args, 'comment');
 				const card = app.board.approveCard(id, comment !== undefined ? { comment } : {});
 				if (!card) throw new Error(`no such card ${id}`);
 				await app.mirrorCard(card, 'approved by review');
-				process.stdout.write(`${card.id} -> ${card.state} (approved)\n`);
+				process.stdout.write(`${card.id} -> ${card.state} (approved; ${describeLanding(landing)})\n`);
 				return 0;
 			}
 
@@ -461,6 +472,7 @@ main()
 	})
 	.catch((err: Error) => {
 		// The guard message is already formatted for a human/agent to act on.
-		process.stderr.write(err instanceof CardWorkerGuardError ? `${err.message}\n` : `error: ${err.message}\n`);
-		process.exitCode = err instanceof CardWorkerGuardError ? 3 : 1;
+		const refused = err instanceof CardWorkerGuardError || err instanceof BoardRuleError;
+		process.stderr.write(refused ? `${err.message}\n` : `error: ${err.message}\n`);
+		process.exitCode = err instanceof CardWorkerGuardError ? 3 : err instanceof BoardRuleError ? 4 : 1;
 	});
