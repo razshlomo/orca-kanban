@@ -128,7 +128,7 @@ test('completion is taken from Orca native agent state, not terminal output', as
 
 	const execute = createOrcaExecutor({
 		orca,
-		config: testConfig({ startupGraceMs: 0, doneConfirmations: 1 }),
+		config: testConfig({ startupGraceMs: 0, doneConfirmations: 1, resultGraceMs: 40 }),
 		orchestration: fakeOrchestration,
 		lookupCard: () => null,
 	});
@@ -159,7 +159,7 @@ test('an early "done" sample is not trusted while still inside the startup grace
 
 	const execute = createOrcaExecutor({
 		orca,
-		config: testConfig({ startupGraceMs: 0, doneConfirmations: 1 }),
+		config: testConfig({ startupGraceMs: 0, doneConfirmations: 1, resultGraceMs: 40 }),
 		orchestration: fakeOrchestration,
 		lookupCard: () => null,
 	});
@@ -303,7 +303,8 @@ test('an agent that finishes with no result file and no status token FAILS expli
 
 	const execute = createOrcaExecutor({
 		orca,
-		config: testConfig(),
+		// Short grace so the genuine no-show is asserted without a real 3-minute wait.
+		config: testConfig({ resultGraceMs: 40, agentPollIntervalMs: 10, doneConfirmations: 1 }),
 		orchestration: fakeOrchestration,
 		lookupCard: () => null,
 	});
@@ -488,4 +489,80 @@ test('a second attempt retires the worktree the first attempt left behind', asyn
 		orca.statusWrites.find((w) => w.selector === "id:repo::/tmp/first-attempt")?.comment ?? "",
 		/superseded by attempt 2/,
 	);
+});
+
+test('a result file that lands after Orca says done is still honoured', async () => {
+	testEnv();
+	const worktree = fakeWorktree();
+
+	// Orca insists the agent is done from the very first sample, but the file only
+	// appears later — exactly the sequence that failed a finished card in the wild.
+	const orca = fakeOrca({
+		worktreePath: worktree,
+		psFrames: [[worktreeRow({ worktreeId: `repo::${worktree}`, path: worktree, agents: [agentRow('done')] })]],
+	});
+
+	const execute = createOrcaExecutor({
+		orca,
+		config: testConfig({ agentPollIntervalMs: 10, doneConfirmations: 1, startupGraceMs: 0, resultGraceMs: 5000 }),
+		orchestration: fakeOrchestration,
+		lookupCard: () => null,
+	});
+
+	const pending = execute(card(), ctx('run_late').value);
+	// Land the file well after the old code would have given up (2 polls ≈ 20ms).
+	setTimeout(() => writeResult(worktree, 'run_late', { status: 'DONE', summary: 'slow but finished' }), 120);
+
+	const result = await pending;
+	assert.equal(result.status, 'DONE', 'the finished work must not be thrown away');
+	assert.equal(result.completionReason, 'result-file');
+	assert.equal(result.summary, 'slow but finished');
+});
+
+test('an agent that really never reports is failed once the grace expires', async () => {
+	testEnv();
+	const worktree = fakeWorktree();
+	const orca = fakeOrca({
+		worktreePath: worktree,
+		psFrames: [[worktreeRow({ worktreeId: `repo::${worktree}`, path: worktree, agents: [agentRow('done')] })]],
+	});
+
+	const execute = createOrcaExecutor({
+		orca,
+		config: testConfig({ agentPollIntervalMs: 10, doneConfirmations: 1, startupGraceMs: 0, resultGraceMs: 60 }),
+		orchestration: fakeOrchestration,
+		lookupCard: () => null,
+	});
+
+	const result = await execute(card(), ctx('run_never').value);
+	assert.equal(result.status, 'FAILED', 'a genuine no-show still fails');
+	assert.equal(result.completionReason, 'agent-done');
+	assert.match(result.error ?? '', /without writing its result file/);
+});
+
+test('an agent that goes back to working resets the countdown', async () => {
+	testEnv();
+	const worktree = fakeWorktree();
+	const row = (state: 'done' | 'working') =>
+		worktreeRow({ worktreeId: `repo::${worktree}`, path: worktree, agents: [agentRow(state)] });
+
+	// done, done, then working again: the grace must restart, not expire.
+	const orca = fakeOrca({
+		worktreePath: worktree,
+		psFrames: [[row('done')], [row('done')], [row('working')], [row('working')], [row('done')]],
+	});
+
+	const execute = createOrcaExecutor({
+		orca,
+		config: testConfig({ agentPollIntervalMs: 10, doneConfirmations: 1, startupGraceMs: 0, resultGraceMs: 45 }),
+		orchestration: fakeOrchestration,
+		lookupCard: () => null,
+	});
+
+	const pending = execute(card(), ctx('run_resume').value);
+	setTimeout(() => writeResult(worktree, 'run_resume', { status: 'DONE', summary: 'resumed then finished' }), 90);
+
+	const result = await pending;
+	assert.equal(result.completionReason, 'result-file', 'the working sample bought it more time');
+	assert.equal(result.summary, 'resumed then finished');
 });

@@ -564,6 +564,8 @@ async function waitForAgent(args: {
 	let sawAgent = false;
 	let lastMessage: string | null = null;
 	let missingRows = 0;
+	/** When Orca first insisted the agent was done, while no result file existed yet. */
+	let doneSince: number | null = null;
 
 	while (true) {
 		if (signal.aborted) return { reason: 'stopped', agentResponse: lastMessage, interrupted: false };
@@ -605,10 +607,27 @@ async function waitForAgent(args: {
 		if (agentInfo?.state === 'done' && (sawAgent || !withinGrace)) {
 			doneHits += 1;
 			if (doneHits >= config.doneConfirmations) {
-				return { reason: 'agent-done', agentResponse: lastMessage, interrupted: false };
+				// "done" is NOT proof the agent finished: the prompt tells it to write the
+				// result file as the very last thing, and Orca reports done between steps.
+				// Observed in the wild: done at 14:37:36, file written at 14:39:51 — the
+				// old code failed the card and threw away six minutes of real work.
+				if (doneSince === null) {
+					doneSince = Date.now();
+					log.event('agent_idle', {
+						cardId,
+						runId,
+						completionReason: 'awaiting-result-file',
+						graceMs: config.resultGraceMs,
+					});
+				}
+				if (Date.now() - doneSince >= config.resultGraceMs) {
+					return { reason: 'agent-done', agentResponse: lastMessage, interrupted: false };
+				}
 			}
 		} else if (agentInfo?.state === 'working') {
+			// It was not finished after all — drop the countdown entirely.
 			doneHits = 0;
+			doneSince = null;
 		} else if (!withinGrace && row.agents.length === 0 && row.liveTerminalCount === 0) {
 			// No agent and no terminals left: the session ended without reporting.
 			return { reason: 'gone', agentResponse: lastMessage, interrupted: false };

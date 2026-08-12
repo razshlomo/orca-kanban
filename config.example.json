@@ -21,6 +21,7 @@
   "startupGraceMs": 12000,
   "agentPollIntervalMs": 4000,
   "doneConfirmations": 2,
+  "resultGraceMs": 180000,
   "cardTimeoutMs": 2700000,
 
   "port": 7420,

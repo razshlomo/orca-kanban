@@ -236,6 +236,13 @@ export type KanbanConfig = {
   cardTimeoutMs: number;
   /** Identity used when claiming cards. */
   workerId: string;
+  /**
+   * After Orca reports the agent done, how long to keep waiting for the result file
+   * before believing it. The prompt asks the agent to write that file last, and Orca
+   * reports `done` between steps, so a short wait here is the difference between a
+   * correct DONE and a card that fails with its work already finished.
+   */
+  resultGraceMs: number;
   /** HTTP port for the board API + UI. */
   port: number;
   /** Recovery policy for cards found stranded in "In Progress". */

@@ -59,6 +59,9 @@ export const DEFAULT_CONFIG: KanbanConfig = {
 	startupGraceMs: 12_000,
 	agentPollIntervalMs: 4000,
 	doneConfirmations: 2,
+	// Orca reports `done` between steps and the agent writes its result file last,
+	// so give that file a real chance to appear before failing the card.
+	resultGraceMs: 180_000,
 	cardTimeoutMs: 45 * 60 * 1000,
 	workerId: `${hostname()}:${process.pid}`,
 	port: 7420,
@@ -125,6 +128,7 @@ export function loadConfig(overrides: Partial<KanbanConfig> = {}): KanbanConfig 
 	if (!Number.isInteger(merged.maxConcurrent)) throw new Error('maxConcurrent must be a whole number of slots');
 	if (merged.pollIntervalMs < 100) throw new Error('pollIntervalMs must be >= 100');
 	if (merged.doneConfirmations < 1) throw new Error('doneConfirmations must be >= 1');
+	if (merged.resultGraceMs < 0) throw new Error('resultGraceMs must be >= 0');
 
 	return merged;
 }

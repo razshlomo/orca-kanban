@@ -248,6 +248,14 @@ Timing knobs: Orca reports no agent for the first seconds after launch, so
 (default 2) requires repeated `done` samples. `cardTimeoutMs` (default 45 min) is the
 hard ceiling per attempt.
 
+`resultGraceMs` (default 3 min) is the one worth understanding. Orca reports an agent
+as `done` between steps, and the prompt asks the agent to write its result file **last**,
+so `done` is not proof of finishing. After a confirmed `done` with no result file the
+executor keeps watching for that file, and an agent that returns to `working` cancels the
+countdown entirely. Seen in the wild before this existed: Orca said done at 14:37:36, the
+agent wrote a perfectly good `status: DONE` at 14:39:51, and the card was failed twice
+with its work already complete.
+
 ---
 
 ## Reviewing a card
@@ -523,7 +531,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 128 tests
+npm test          # 131 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```
