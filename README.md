@@ -68,7 +68,7 @@ Requirements: the Orca desktop app running (`orca status`), Node ≥ 22.5, and t
 CLI you want (`omp`, `codex`, `claude`, `cursor`, …) on `PATH`.
 
 ```bash
-git clone https://github.com/razshlomo/orca-kandan.git ~/.orca-kanban
+git clone https://github.com/razshlomo/orca-kanban.git ~/.orca-kanban
 cd ~/.orca-kanban
 npm install                     # typescript, for `npm run typecheck` only — runtime has zero deps
 cp config.example.json config.json   # then set "defaultRepo"
@@ -92,7 +92,7 @@ a Jira workflow.
 Claude Code users can install it as a plugin instead of running the script:
 
 ```
-/plugin marketplace add razshlomo/orca-kandan
+/plugin marketplace add razshlomo/orca-kanban
 ```
 
 **Worker guard.** The scheduler launches agents as card workers, and those workers load

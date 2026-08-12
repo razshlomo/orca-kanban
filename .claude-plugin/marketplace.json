@@ -18,8 +18,8 @@
         "name": "Raz Shlomo",
         "url": "https://github.com/razshlomo"
       },
-      "homepage": "https://github.com/razshlomo/orca-kandan",
-      "repository": "https://github.com/razshlomo/orca-kandan",
+      "homepage": "https://github.com/razshlomo/orca-kanban",
+      "repository": "https://github.com/razshlomo/orca-kanban",
       "license": "MIT",
       "keywords": ["orca", "kanban", "agents", "scheduler", "worktree", "omp", "codex"]
     }
