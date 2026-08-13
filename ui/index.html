@@ -15,6 +15,9 @@
 				--accent: #4493f8;
 				--ok: #3fb950;
 				--warn: #d29922;
+				/* Distinct from --warn (a card the board is holding) and --accent (selection):
+				   this one means a person has the keys. */
+				--mine: #a371f7;
 				--bad: #f85149;
 				--radius: 8px;
 			}
@@ -61,9 +64,14 @@
 			}
 			.card:hover { border-color: #3a3a44; }
 			.card.sel { border-color: var(--accent); }
+			/* A card the board has stopped watching. The left bar is deliberately loud: it is
+			   the one state where nothing progresses unless you come back to it. */
+			.card.mine { border-left: 3px solid var(--mine); background: #1d1b26; }
+			.card.mine.sel { border-color: var(--mine); border-left-width: 3px; }
 			.card .t { font-weight: 600; margin-bottom: 4px; word-break: break-word; }
 			.meta { display: flex; gap: 6px; flex-wrap: wrap; color: var(--muted); font-size: 11px; }
 			.tag { background: #22222a; border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
+			.tag.mine { color: var(--mine); border-color: #3d2f56; }
 			.tag.p { color: var(--accent); }
 			.tag.err { color: var(--bad); }
 			/* The panel is a form, so it gets a form's shape: a fixed identity strip at the
@@ -98,6 +106,8 @@
 			details.group[open] > summary::before { transform: rotate(90deg); }
 			details.group > summary:hover { color: var(--text); }
 			details.group > summary .n { margin-left: auto; font-weight: 400; letter-spacing: 0; text-transform: none; }
+			details.group.mine > summary { color: var(--mine); }
+			details.group.mine > summary .n { color: var(--mine); }
 			.group-body { padding: 0 0 12px; }
 
 			label { display: block; font-size: 11px; color: var(--muted); margin: 8px 0 3px; }
@@ -277,8 +287,12 @@
 					? `<span class="dot" style="background:${color}"></span>not running`
 					: `<span class="dot" style="background:${color}"></span>${esc(s.runState || '—')}${s.autoRun ? ' · auto' : ''}`;
 				document.getElementById('sstate').title = dead ? `${s.live.reason} — start it with: kanban serve` : '';
-				document.getElementById('scount').textContent =
-					`${s.cardsExecuted ?? 0} executed · ${s.inFlightCount ?? 0}/${s.maxConcurrent ?? 1} slots`;
+				// A card you are holding progresses only when you come back to it, so the count
+				// belongs in the header where you cannot miss having forgotten one.
+				const held = (snapshot.cards || []).filter((c) => c.manualSince);
+				document.getElementById('scount').innerHTML =
+					`${s.cardsExecuted ?? 0} executed · ${s.inFlightCount ?? 0}/${s.maxConcurrent ?? 1} slots` +
+					(held.length ? ` · <span style="color:var(--mine)" title="${esc(held.map((c) => c.id).join(', '))}">${held.length} yours</span>` : '');
 
 				// Every lane, not just the first, so a multi-slot board is legible.
 				const lanes = s.inFlight || [];
@@ -351,7 +365,9 @@
 
 			function cardEl(c) {
 				const el = document.createElement('div');
-				el.className = 'card' + (c.id === selectedId ? ' sel' : '');
+				// `mine` is the loudest thing a card can be: the board has stopped watching it
+				// and only you can move it on. A left border reads at a glance across columns.
+				el.className = 'card' + (c.id === selectedId ? ' sel' : '') + (c.manualSince ? ' mine' : '');
 				el.draggable = true;
 				const eligible = (snapshot.eligible || []).includes(c.id);
 				el.innerHTML =
@@ -362,6 +378,7 @@
 						${c.dependencies.length ? `<span class="tag">deps ${c.dependencies.length}</span>` : ''}
 						${c.attemptCount ? `<span class="tag">try ${c.attemptCount}/${c.maxAttempts}</span>` : ''}
 						${eligible ? '<span class="tag" style="color:var(--ok)">eligible</span>' : ''}
+						${c.manualSince ? `<span class="tag mine" title="You took this session on ${new Date(c.manualSince).toLocaleString()} — the board is not watching it">yours ${rel(c.manualSince).replace(' ago', '')}</span>` : ''}
 						${!eligible && c.heldBecause ? `<span class="tag" style="color:var(--warn)">${esc(c.heldBecause)}</span>` : ''}
 						${c.repeatEveryMs ? '<span class="tag">repeats</span>' : ''}
 						${c.lastResult ? `<span class="tag ${c.lastResult === 'DONE' ? '' : 'err'}">${esc(c.lastResult)}</span>` : ''}
@@ -452,6 +469,7 @@
 				const running = c.state === 'In Progress';
 				const stoppable = inFlightIds.includes(c.id);
 				const reviewable = c.state === 'Review' || c.state === 'Blocked';
+				const mine = Boolean(c.manualSince);
 				const can = {
 					retry: !running && (c.state === 'Blocked' || c.attemptCount > 0),
 					destroy: !running,
@@ -461,6 +479,10 @@
 					// The transcript lives on disk keyed by the worktree, so a closed terminal is
 					// not a dead end: a worktree plus a resume-capable agent is all it takes.
 					resume: Boolean(c.worktreePath) && Boolean(resumeCommandFor(c)),
+					// Taking over needs a live session to take; taking back needs the worktree
+					// the watch will re-attach to.
+					takeOver: running && !mine && Boolean(c.sessionId),
+					takeBack: mine && Boolean(c.worktreePath),
 				};
 				const why = {
 					retry: running ? 'Stop the card first' : 'Nothing has been attempted yet',
@@ -471,6 +493,12 @@
 					resume: !c.worktreePath
 						? 'This card has never run, so there is no conversation'
 						: `${esc(c.agent || snapshot.config.defaultAgent)} has no resume command configured`,
+					takeOver: mine
+						? 'You already have this card'
+						: !running
+							? `Only a running card has a live session to take — this one is in ${c.state}`
+							: 'This card has no live session',
+					takeBack: 'The board is already watching this card',
 				};
 				try { runs = (await api(`/api/cards/${encodeURIComponent(c.id)}/runs`)).runs; } catch {}
 				try { comments = (await api(`/api/cards/${encodeURIComponent(c.id)}/comments`)).comments; } catch {}
@@ -538,6 +566,36 @@
 							${running && !stoppable ? '<div class="hint">Running under another scheduler, so it cannot be stopped from here.</div>' : ''}
 						</div>
 					</details>
+
+					${
+						mine
+							? `<details class="group mine" data-g="mine" open>
+						<summary>You have this card<span class="n">for ${esc(rel(c.manualSince).replace(" ago", ""))}</span></summary>
+						<div class="group-body">
+							<div class="hint">The board is not watching this session. It will not judge the card, move it,
+							or close the terminal — and its slot stays held, because the lane is yours. Steer the agent,
+							edit by hand, do both. Take back when you want the board watching again.</div>
+							<div class="actions">
+								<button class="primary" ${can.takeBack ? '' : `disabled title="${esc(why.takeBack)}"`} onclick="takeBack()">Take back</button>
+								<button ${can.openSession ? '' : `disabled title="${esc(why.openSession)}"`} onclick="openInOrca('session')">Open session</button>
+								${stoppable ? '<button class="danger" onclick="stopThisCard()">Stop this card</button>' : ''}
+							</div>
+						</div>
+					</details>`
+							: running
+								? `<details class="group" data-g="mine" ${open('mine', false)}>
+						<summary>Take over<span class="n">the board is watching</span></summary>
+						<div class="group-body">
+							<div class="hint">Interrupts the agent mid-turn and hands you the session. Pressing Esc in the
+							terminal does exactly the same thing. Nothing settles this card until you take it back.</div>
+							<div class="actions">
+								<button ${can.takeOver ? '' : `disabled title="${esc(why.takeOver)}"`} onclick="takeOver()">Take over</button>
+								<button ${can.openSession ? '' : `disabled title="${esc(why.openSession)}"`} onclick="openInOrca('session')">Open session</button>
+							</div>
+						</div>
+					</details>`
+								: ''
+					}
 
 					<details class="group" data-g="review" ${open('review', reviewable)}>
 						<summary>Review<span class="n">${reviewable ? 'your call' : esc(c.lastResult || 'not run')}</span></summary>
@@ -732,6 +790,30 @@
 				baseline = null;
 				await refresh();
 				reportSave(`Reopened with ${out.command}`, "ok");
+			}
+
+			async function takeOver() {
+				renderFooter('Taking over\u2026');
+				try {
+					await api(`/api/cards/${encodeURIComponent(selectedId)}/takeover`, 'POST', {});
+				} catch (e) {
+					return reportSave(e.message, 'bad');
+				}
+				baseline = null;
+				await refresh();
+				reportSave('Yours \u2014 the board has stopped watching', 'ok');
+			}
+
+			async function takeBack() {
+				renderFooter('Handing back\u2026');
+				try {
+					await api(`/api/cards/${encodeURIComponent(selectedId)}/takeback`, 'POST', {});
+				} catch (e) {
+					return reportSave(e.message, 'bad');
+				}
+				baseline = null;
+				await refresh();
+				reportSave('The board is watching this session again', 'ok');
 			}
 
 			async function retryCard() {

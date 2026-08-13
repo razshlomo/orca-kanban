@@ -91,6 +91,7 @@ function rowToCard(row: Row): Card {
 		// fallback keeps a hand-inserted row from producing NaN.
 		stateChangedAt: Number(row['state_changed_at'] ?? row['updated_at']),
 		notBefore: row['not_before'] === null || row['not_before'] === undefined ? null : Number(row['not_before']),
+		manualSince: row['manual_since'] === null || row['manual_since'] === undefined ? null : Number(row['manual_since']),
 		repeatEveryMs:
 			row['repeat_every_ms'] === null || row['repeat_every_ms'] === undefined ? null : Number(row['repeat_every_ms']),
 		claimedAt: row['claimed_at'] === null || row['claimed_at'] === undefined ? null : Number(row['claimed_at']),
@@ -442,6 +443,76 @@ export class Board extends EventEmitter {
 	}
 
 	/**
+	 * Hands a running card's session to the human at the keyboard.
+	 *
+	 * The card does not move and its run is not closed — the run is genuinely still
+	 * going, a person is just driving it now. What stops is the board's supervision:
+	 * the executor returns without closing the terminal, and nothing will settle this
+	 * card until `takeBack`. The slot stays held because the lane is occupied by you.
+	 *
+	 * Idempotent: the first hand-over wins, so an Esc and a Take over click racing
+	 * each other cannot produce two different start times.
+	 */
+	handToHuman(id: string, reason: string): Card | null {
+		const card = this.getCard(id);
+		if (!card) return null;
+		if (card.manualSince !== null) return card;
+		if (card.state !== 'In Progress') {
+			throw new BoardRuleError(
+				`Cannot take over a card in ${card.state}; only a running card has a live session to take.`,
+				card.id,
+				card.state,
+			);
+		}
+
+		const now = Date.now();
+		this.db.prepare('UPDATE cards SET manual_since = ?, updated_at = ? WHERE id = ?').run(now, now, id);
+		this.addComment(id, reason, { author: 'board' });
+		this.recordEvent('card_handed_over', {
+			cardId: id,
+			runId: this.openRunsForCard(id)[0]?.id ?? null,
+			sessionId: card.sessionId,
+			data: { reason },
+		});
+		this.touched('card_handed_over', id);
+		return this.getCard(id);
+	}
+
+	/**
+	 * Gives supervision back to the board. Clears the marker only — restarting the
+	 * watch on the still-live session is the scheduler's job, because only it owns
+	 * slots and executors.
+	 */
+	takeBack(id: string): Card | null {
+		const card = this.getCard(id);
+		if (!card) return null;
+		if (card.manualSince === null) {
+			throw new BoardRuleError(
+				`Cannot take back ${card.id}: the board is already watching it.`,
+				card.id,
+				card.state,
+			);
+		}
+
+		const held = Date.now() - card.manualSince;
+		this.db.prepare('UPDATE cards SET manual_since = NULL, updated_at = ? WHERE id = ?').run(Date.now(), id);
+		this.addComment(id, `Handed back to the board after ${formatRelative(card.manualSince).replace(' ago', '')}.`, { author: 'board' });
+		this.recordEvent('card_taken_back', {
+			cardId: id,
+			runId: this.openRunsForCard(id)[0]?.id ?? null,
+			sessionId: card.sessionId,
+			data: { heldMs: held },
+		});
+		this.touched('card_taken_back', id);
+		return this.getCard(id);
+	}
+
+	/** Cards a human is holding right now, board-wide. */
+	manualCards(): Card[] {
+		return (this.db.prepare('SELECT * FROM cards WHERE manual_since IS NOT NULL').all() as Row[]).map(rowToCard);
+	}
+
+	/**
 	 * Defers a card: it stays where it is on the board but cannot be claimed until
 	 * `dueAt`. This is "look at this again later" without losing the card.
 	 */
@@ -776,6 +847,16 @@ export class Board extends EventEmitter {
 	 *   FAILED/TIMEOUT-> Ready while retry budget remains, otherwise Blocked
 	 */
 	persistResult(card: Card, result: ExecutionResult, options: PersistOptions): Card {
+		// A hand-over is not an outcome: nothing was judged, so nothing may be recorded
+		// as the card's result. The scheduler routes it to `handToHuman` instead, and a
+		// caller that gets here has lost that branch.
+		if (result.status === 'HANDED_OVER') {
+			throw new Error(`persistResult called for a handed-over card ${card.id}; use handToHuman`);
+		}
+		// Narrowed here rather than at the use site: `finishRun` is called inside the
+		// transaction closure, and TypeScript cannot carry the check above into it.
+		const runStatus: RunStatus = result.status;
+
 		const fresh = this.getCard(card.id) ?? card;
 		const attempts = fresh.attemptCount;
 		const retryAvailable = attempts < fresh.maxAttempts;
@@ -810,7 +891,7 @@ export class Board extends EventEmitter {
 				);
 
 			this.finishRun(result.runId, {
-				status: result.status,
+				status: runStatus,
 				commitSha: result.commitSha,
 				summary: result.summary,
 				error: result.error,

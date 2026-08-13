@@ -24,6 +24,7 @@ function card(over: Partial<Card> = {}): Card {
 		updatedAt: now,
 		stateChangedAt: now,
 		notBefore: null,
+	manualSince: null,
 		repeatEveryMs: null,
 		claimedAt: now,
 		claimedBy: 'test-worker',
@@ -221,7 +222,7 @@ test('a parsed result file short-circuits the wait and wins over the tail', asyn
 	assert.match(result.concerns ?? '', /blocked on secrets/);
 });
 
-test('an interrupted agent is reported as FAILED', async () => {
+test('an interrupted agent hands the session over instead of failing the card', async () => {
 	testEnv();
 	const worktree = fakeWorktree();
 	const orca = fakeOrca({
@@ -239,15 +240,24 @@ test('an interrupted agent is reported as FAILED', async () => {
 
 	const execute = createOrcaExecutor({
 		orca,
-		config: testConfig(),
+		// Armed on purpose: with closing disabled the assertion below would pass even if
+		// the guard were removed.
+		config: testConfig({ closeSessionWhenDone: true }),
 		orchestration: fakeOrchestration,
 		lookupCard: () => null,
 	});
 
 	const result = await execute(card(), ctx('run_int').value);
-	assert.equal(result.completionReason, 'interrupted');
-	assert.equal(result.status, 'FAILED');
-	assert.match(result.error ?? '', /interrupted/i);
+	assert.equal(result.completionReason, 'handed-over');
+	assert.equal(result.status, 'HANDED_OVER');
+	// Nothing was judged, so nothing may be reported as a verdict.
+	assert.equal(result.error, null);
+
+	// The whole point: pressing Esc used to close the terminal being rescued.
+	assert.ok(
+		!orca.calls.some((c) => c.startsWith('terminalClose:')),
+		'a handed-over session must stay open — closing it destroys the work being taken over',
+	);
 });
 
 test('a card that never finishes hits the timeout instead of hanging', async () => {

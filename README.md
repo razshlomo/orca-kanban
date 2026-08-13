@@ -565,6 +565,55 @@ for the card's state is open when it opens:
 | Review | agent summary, diff, **Resume conversation**, verdict, review trail | when the card is in Review or Blocked |
 | Runs and technical | run history, worktree, session, commit | no |
 
+### Taking a running card by hand
+
+Sometimes an agent is going the wrong way and you want the keyboard, mid-turn, without
+losing its conversation or its worktree. **Take over** does that:
+
+```
+kanban card takeover <id>      # interrupt the agent and take its session
+kanban card takeback <id>      # give supervision back to the board
+```
+
+Pressing **Esc** in the agent terminal does the same thing, when Orca reports the agent
+(see the limitation below). Either way the card enters one clear mode:
+
+| While the card is yours | |
+| --- | --- |
+| Column | stays **In Progress** — nothing was judged, so nothing moves |
+| Slot | **stays held**: you occupy the lane you are working in |
+| Terminal | never closed |
+| Result file | ignored |
+| Idle / timeout | **no clock at all** — it is yours until you hand it back |
+| Delete / Hold / Retry | still refused, because the agent and worktree are live |
+| Editing the card text | allowed |
+
+The card shows a purple left border, a `yours 5m` tag, and a `1 yours` count in the
+header, because a held card only moves when you come back to it.
+
+**Take back** restarts the board’s watch on the same live session, reusing the original
+run — so the agent’s result file is still the one the board is waiting for. It is the same
+code path crash recovery uses, which is why it works two minutes later or after an Orca
+restart, when no watch loop exists at all.
+
+Recovery never touches a held card. It reports it and stops:
+
+```
+inspected 0 · adopted 0 · requeued 0 · blocked 0 · held 1
+```
+
+**Two limitations worth knowing.**
+
+The Esc gesture needs Orca to report the agent for that worktree. Orca tracks agents it
+launched into a pane; for some worktrees it reports `agents: []` with a live terminal, and
+there the board cannot see an interrupt at all — such cards settle purely by result file,
+as they always have. **Take over from the board works either way**, because it writes the
+marker itself instead of waiting to be told.
+
+Any interrupt hands the card over, including one you did not cause — a rate limit, a
+crashed tool. That is better than the old behaviour (marked FAILED, terminal closed,
+evidence gone), but such a card waits for you rather than retrying. The header count and
+`kanban status` are what stop it going unnoticed.
 ### Reopening the agent conversation
 
 A card's Orca terminal closes when the card settles (`closeSessionWhenDone`), because one
@@ -668,7 +717,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 175 tests
+npm test          # 194 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```

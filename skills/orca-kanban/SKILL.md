@@ -163,6 +163,16 @@ is never picked up, so the card stays parked even after the date passes. Ready p
 `(waiting on card_x)`, `(no retries left)` — so check there before assuming a card
 is stuck.
 
+## A card a human is holding
+
+`kanban card takeover <id>` interrupts a running agent and hands its session to the
+person at the keyboard; `kanban card takeback <id>` gives it back to the board. While a
+card is held it stays In Progress, keeps its slot, and **nothing** settles it — no result
+file, no idle check, no timeout.
+
+Never take a card back that you did not take over, and never assume a card sitting in
+In Progress is stuck: check `kanban status` first, which names every held card.
+
 ## Reopening an agent conversation
 
 A finished card's Orca terminal is closed, but its conversation is not gone: OMP stores

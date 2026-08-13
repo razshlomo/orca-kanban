@@ -153,6 +153,20 @@ const MIGRATIONS: string[] = [
 		UPDATE cards SET state_changed_at = new.created_at WHERE id = new.id;
 	END;
 	`,
+
+	// v5 — manual control of a live session.
+	`
+	/* Epoch ms when a human took the session. While set the board stops supervising the
+	   card entirely: no result-file settle, no idle settle, no timeout, no terminal close.
+
+	   Deliberately NOT a seventh card state. cards.state carries a CHECK constraint, and
+	   both card_runs and card_comments reference cards(id) ON DELETE CASCADE with foreign
+	   keys enforced — so adding a state value means a table rebuild that would take every
+	   run and comment with it. A nullable column is the whole change, and it keeps the
+	   existing guards working: the card really is In Progress, so delete/hold/retry stay
+	   refused, and the slot stays held because the lane is occupied by you. */
+	ALTER TABLE cards ADD COLUMN manual_since INTEGER;
+	`,
 ];
 
 /**

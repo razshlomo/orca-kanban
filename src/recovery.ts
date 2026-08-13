@@ -11,7 +11,7 @@ export type RecoveryDecision = {
 	 * requeue - work is gone, retry budget left; back to Ready
 	 * block   - work is gone and out of retries (or policy says block)
 	 */
-	action: 'adopt' | 'requeue' | 'block';
+	action: 'adopt' | 'requeue' | 'block' | 'held';
 	reason: string;
 	openRun: CardRun | null;
 	sessionId: string | null;
@@ -24,6 +24,11 @@ export type RecoveryReport = {
 	adopted: RecoveryDecision[];
 	requeued: RecoveryDecision[];
 	blocked: RecoveryDecision[];
+	/**
+	 * Cards a human took by hand. Reported, never acted on: recovery has no business
+	 * deciding the fate of a card somebody deliberately claimed.
+	 */
+	held: RecoveryDecision[];
 };
 
 /**
@@ -41,8 +46,36 @@ export async function recoverStrandedCards(deps: {
 	log: Logger;
 }): Promise<RecoveryReport> {
 	const { board, orca, config, log } = deps;
-	const stranded = board.cardsInState('In Progress');
-	const report: RecoveryReport = { inspected: stranded.length, adopted: [], requeued: [], blocked: [] };
+	// A card somebody took by hand is not stranded, however long it has been sitting:
+	// its terminal is deliberately open and no scheduler is meant to be watching it.
+	// Recovering it would close the session and move the card under its owner.
+	const inProgress = board.cardsInState('In Progress');
+	const held = inProgress.filter((c) => c.manualSince !== null);
+	const stranded = inProgress.filter((c) => c.manualSince === null);
+
+	const report: RecoveryReport = {
+		inspected: stranded.length,
+		adopted: [],
+		requeued: [],
+		blocked: [],
+		held: held.map((card) => ({
+			card,
+			action: 'held' as const,
+			reason: `Held by hand since ${new Date(card.manualSince as number).toLocaleString()}; left alone. Take it back or stop it.`,
+			openRun: board.openRunsForCard(card.id)[0] ?? null,
+			sessionId: card.sessionId,
+			resume: null,
+		})),
+	};
+
+	for (const decision of report.held) {
+		log.event('card_handed_over', {
+			cardId: decision.card.id,
+			runId: decision.openRun?.id ?? null,
+			sessionId: decision.sessionId,
+			held: true,
+		});
+	}
 
 	if (stranded.length === 0) {
 		clearStaleSchedulerState(board);

@@ -206,6 +206,18 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 			return;
 		}
 
+		if (action === '/takeover' && method === 'POST') {
+			const card = await app.takeOver(id);
+			send(res, 200, { card, interrupted: Boolean(card.sessionId) });
+			return;
+		}
+
+		if (action === '/takeback' && method === 'POST') {
+			const { card, run } = await app.scheduler.takeBack(id);
+			send(res, 200, { card, runId: run.id });
+			return;
+		}
+
 		if (action === '/resume' && method === 'POST') {
 			const card = app.board.getCard(id);
 			if (!card) return send(res, 404, { error: `no such card ${id}` });
@@ -369,6 +381,7 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 				send(res, 200, {
 					inspected: report.inspected,
 					adopted: report.adopted.map((d) => d.card.id),
+					held: report.held.map((d) => d.card.id),
 					requeued: report.requeued.map((d) => d.card.id),
 					blocked: report.blocked.map((d) => d.card.id),
 				});

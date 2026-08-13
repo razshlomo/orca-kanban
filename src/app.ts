@@ -23,6 +23,12 @@ export type App = {
 	 */
 	mirrorCard: (card: Card, comment?: string) => Promise<void>;
 	recover: () => Promise<RecoveryReport>;
+	/**
+	 * Takes the card's live session by hand: marks it, then interrupts the agent so it
+	 * stops mid-turn. The mark is written first, so the watch loop cannot settle the
+	 * card in the gap and close the terminal being claimed.
+	 */
+	takeOver: (id: string) => Promise<Card>;
 	close: () => void;
 };
 
@@ -88,6 +94,25 @@ export function createApp(
 				void scheduler.adoptCard(decision.card, decision.openRun, decision.resume);
 			}
 			return report;
+		},
+		takeOver: async (id) => {
+			const card = board.handToHuman(id, 'Session taken over by hand from the board.');
+			if (!card) throw new Error(`no such card ${id}`);
+
+			// Best-effort: the mark is what stops the board, so a terminal that will not
+			// take an interrupt still leaves the card yours rather than half-claimed.
+			if (card.sessionId) {
+				try {
+					await orca.terminalSend({ handle: card.sessionId, interrupt: true });
+				} catch (err) {
+					log.warn('could not interrupt the agent; the card is yours but its turn may still be running', {
+						cardId: id,
+						sessionId: card.sessionId,
+						error: (err as Error).message,
+					});
+				}
+			}
+			return card;
 		},
 		close: () => board.close(),
 	};

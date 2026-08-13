@@ -26,6 +26,8 @@ Usage:
   orca-kanban card comment <id> <text>           Add a note to the card's review trail
   orca-kanban card diff <id>                     Show the card's changes, untracked included
   orca-kanban card open <id> [--session]         Open the changes (or session) in Orca
+  orca-kanban card takeover <id>                 Interrupt the agent and take its session
+  orca-kanban card takeback <id>                 Give the session back to the board
   orca-kanban card resume <id>                   Reopen the agent's conversation for a card
   orca-kanban recover                            Reconcile cards stranded In Progress
   orca-kanban status                             Show board + scheduler status
@@ -113,6 +115,7 @@ async function main(): Promise<number> {
 				adopted: report.adopted.length,
 				requeued: report.requeued.length,
 				blocked: report.blocked.length,
+				held: report.held.length,
 			});
 		}
 
@@ -262,7 +265,9 @@ async function main(): Promise<number> {
 						c.state === 'Review' || c.state === 'Blocked'
 							? `waiting ${formatRelative(c.stateChangedAt).replace(' ago', '')}`
 							: '';
-					const note = [waiting, why].filter(Boolean).join(', ');
+					// Loudest note on the row: this card moves only when you come back to it.
+					const yours = c.manualSince ? `yours since ${formatRelative(c.manualSince).replace(' ago', '')}` : '';
+					const note = [yours, waiting, why].filter(Boolean).join(', ');
 					process.stdout.write(
 						`${c.id}  ${c.state.padEnd(11)} P${String(c.priority).padEnd(4)} ` +
 							`${eligible.has(c.id) ? '✓' : ' '} ${c.attemptCount}/${c.maxAttempts}  ${c.title}` +
@@ -388,6 +393,43 @@ async function main(): Promise<number> {
 				return 0;
 			}
 
+			if (sub === 'takeover') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+				const card = await app.takeOver(id);
+				process.stdout.write(
+					`${card.id} -> yours (${card.state}, session ${card.sessionId ?? 'none'})\n` +
+						`the board has stopped watching it; hand it back with: kanban card takeback ${card.id}\n`,
+				);
+				return 0;
+			}
+
+			if (sub === 'takeback') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+
+				// Handing back means somebody has to watch the session. A daemon already owns
+				// execution if one is alive, and two watchers on one agent would both try to
+				// settle the card — so route it there instead of racing it.
+				const live = schedulerLiveness(app.board.schedulerStatus(), app.config.pollIntervalMs);
+				if (live.alive) {
+					throw new Error(
+						`a scheduler is already running (pid ${app.board.schedulerStatus().ownerPid}); hand it back there — ` +
+							`in the board UI, or: curl -XPOST localhost:${app.config.port}/api/cards/${id}/takeback`,
+					);
+				}
+
+				const { card, run, settled } = await app.scheduler.takeBack(id);
+				process.stdout.write(`${card.id} -> watched here (run ${run.id}); waiting for the agent\n`);
+				const outcome = await settled;
+				process.stdout.write(
+					outcome
+						? `${outcome.card.id} -> ${outcome.result.status} (${app.board.getCard(id)?.state})\n`
+						: `${id} -> no outcome\n`,
+				);
+				return 0;
+			}
+
 			if (sub === 'resume') {
 				const id = args._[2];
 				if (!id) throw new Error('a card id is required');
@@ -436,9 +478,9 @@ async function main(): Promise<number> {
 		const app = createApp();
 		const report = await app.recover();
 		process.stdout.write(
-			`inspected ${report.inspected} · adopted ${report.adopted.length} · requeued ${report.requeued.length} · blocked ${report.blocked.length}\n`,
+			`inspected ${report.inspected} · adopted ${report.adopted.length} · requeued ${report.requeued.length} · blocked ${report.blocked.length} · held ${report.held.length}\n`,
 		);
-		for (const d of [...report.adopted, ...report.requeued, ...report.blocked]) {
+		for (const d of [...report.adopted, ...report.requeued, ...report.blocked, ...report.held]) {
 			process.stdout.write(`  ${d.card.id} ${d.action}: ${d.reason}\n`);
 		}
 		app.close();
@@ -464,6 +506,13 @@ async function main(): Promise<number> {
 		process.stdout.write(`slots:     ${inFlight}/${app.config.maxConcurrent} in flight\n`);
 		for (const flight of s.inFlight) {
 			process.stdout.write(`  running: ${flight.cardId} · session ${flight.sessionId ?? '—'}\n`);
+		}
+		// Held cards are not in any lane and nothing is watching them, so without this
+		// line a card you took an hour ago is invisible in the one place you would look.
+		for (const c of app.board.manualCards()) {
+			process.stdout.write(
+				`  yours:   ${c.id} · since ${formatRelative(c.manualSince as number)} · take back with: kanban card takeback ${c.id}\n`,
+			);
 		}
 		process.stdout.write(`executed:  ${s.cardsExecuted}\n`);
 		process.stdout.write(`cards:     ${[...byState].map(([k, v]) => `${k}=${v}`).join(' ') || 'none'}\n`);

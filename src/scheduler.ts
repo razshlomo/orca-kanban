@@ -322,6 +322,43 @@ export class Scheduler extends EventEmitter {
 	}
 
 	/**
+	 * Gives a hand-held card back to the board and restarts the watch on the very same
+	 * live session — the agent keeps its conversation, its worktree and its result file.
+	 *
+	 * Deliberately built on the same `resume` path as crash recovery, so taking a card
+	 * back works identically two minutes later or after an Orca restart, when no watch
+	 * loop exists at all.
+	 */
+	async takeBack(cardId: string): Promise<{ card: Card; run: CardRun; settled: Promise<IterationOutcome> }> {
+		const card = this.board.getCard(cardId);
+		if (!card) throw new Error(`no such card ${cardId}`);
+		if (card.manualSince === null) throw new Error(`${cardId} is not being held by hand`);
+		if (!card.worktreePath || !card.worktreeId) {
+			throw new Error(`${cardId} has no worktree to watch; stop the card instead`);
+		}
+
+		// The run was never closed, so its id still names the result file the agent was
+		// told to write. A fresh run would look for a file that will never appear.
+		const run = this.board.openRunsForCard(cardId)[0];
+		if (!run) throw new Error(`${cardId} has no open run; stop the card instead`);
+
+		const taken = this.board.takeBack(cardId);
+		if (!taken) throw new Error(`${cardId} vanished while being handed back`);
+
+		// Returned rather than awaited: a server answers the click at once, while the CLI
+		// can block on the same watch when it is the only process around to do it.
+		const settled = this.adoptCard(taken, run, {
+			worktreeId: card.worktreeId,
+			worktreePath: card.worktreePath,
+			branch: card.branch,
+			sessionId: card.sessionId,
+			runId: run.id,
+		});
+
+		return { card: taken, run, settled };
+	}
+
+	/**
 	 * Shared tail of a card execution: run the agent, persist the outcome, emit the
 	 * lifecycle events, and mirror the resulting state onto Orca's board.
 	 */
@@ -370,6 +407,25 @@ export class Scheduler extends EventEmitter {
 				startedAt: run.startedAt,
 				finishedAt: Date.now(),
 			};
+		}
+
+		// A hand-over is not an outcome. The card does not move, the run stays open —
+		// it genuinely is still going, a person is driving it — and nothing settles this
+		// card until `takeBack`. Persisting it as a result would be a lie.
+		if (result.status === 'HANDED_OVER') {
+			this.board.handToHuman(
+				card.id,
+				result.agentResponse
+					? 'Session taken over by hand. The board has stopped watching this card.'
+					: 'Session taken over by hand before the agent reported anything.',
+			);
+			this.emitEvent('card_handed_over', {
+				cardId: card.id,
+				runId: run.id,
+				sessionId: result.sessionId,
+				completionReason: result.completionReason,
+			});
+			return { card, result };
 		}
 
 		const persisted = this.board.persistResult(card, result, { successState: this.config.successState });

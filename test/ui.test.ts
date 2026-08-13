@@ -78,3 +78,35 @@ test('sections remember only deliberate opens', () => {
 	assert.match(script, /querySelector\('summary'\)\.addEventListener\('click'/);
 	assert.ok(!script.includes("addEventListener('toggle'"), 'toggle is the leaky signal');
 });
+
+test('a held card is visually distinct, not just differently worded', () => {
+	// A purple left border and a tag, because a held card only moves when its owner
+	// returns to it — it must be findable by eye across six columns.
+	assert.match(html, /--mine:\s*#[0-9a-f]{6}/i);
+	assert.match(html, /\.card\.mine\s*\{[^}]*border-left:\s*3px solid var\(--mine\)/);
+	assert.match(script, /c\.manualSince\s*\?\s*' mine'/);
+	assert.match(script, /class="tag mine"[^`]*yours/);
+});
+
+test('the header counts held cards, so one cannot be forgotten', () => {
+	const header = script.slice(script.indexOf("const held = "), script.indexOf("getElementById('scur')"));
+	assert.match(header, /manualSince/);
+	assert.match(header, /yours/);
+});
+
+test('take over and take back are gated on real state, never offered blindly', () => {
+	const can = script.slice(script.indexOf('const can = {'), script.indexOf('const why = {'));
+	// Taking over needs a live session; taking back needs the worktree to re-attach to.
+	assert.match(can, /takeOver:\s*running && !mine && Boolean\(c\.sessionId\)/);
+	assert.match(can, /takeBack:\s*mine && Boolean\(c\.worktreePath\)/);
+
+	const why = script.slice(script.indexOf('const why = {'), script.indexOf('try { runs'));
+	assert.match(why, /takeOver:/);
+	assert.match(why, /takeBack:/);
+
+	// Both buttons must carry the disabled+title treatment every other control uses.
+	for (const fn of ['takeOver', 'takeBack']) {
+		const re = new RegExp(`can\\.${fn} \\? '' : \`disabled title="\\$\\{esc\\(why\\.${fn}\\)\\}"\``);
+		assert.match(html, re, `${fn} must say why it is disabled`);
+	}
+});

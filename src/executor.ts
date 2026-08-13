@@ -190,6 +190,8 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 		let worktreePath: string | null = ctx.resume?.worktreePath ?? null;
 		let branch: string | null = ctx.resume?.branch ?? null;
 		let createdWorktree = false;
+		/** Set when the human took the session: the finally block must not close it. */
+		let handedOver = false;
 		let orcaTaskId: string | null = card.orcaTaskId;
 		let orcaDispatchId: string | null = card.orcaDispatchId;
 
@@ -347,6 +349,8 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 				cardId: card.id,
 				runId: ctx.runId,
 				startedAt,
+				resumed: resuming,
+				lookupCard,
 			});
 
 			ctx.log.event('agent_idle', {
@@ -356,6 +360,31 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 				completionReason: completion.reason,
 				interrupted: completion.interrupted,
 			});
+
+			// ------------------------------------------------------------ hand over
+			// The session is now the human's. Return before anything that would end the
+			// run: no result read, no archive of the handshake files (take back needs
+			// them), no orchestration settle, and — via `handedOver` — no terminal close.
+			if (completion.reason === 'handed-over') {
+				handedOver = true;
+				ctx.log.event('card_handed_over', {
+					cardId: card.id,
+					runId: ctx.runId,
+					sessionId,
+					interrupted: completion.interrupted,
+				});
+				return {
+					...base,
+					status: 'HANDED_OVER',
+					completionReason: 'handed-over',
+					sessionId,
+					branch,
+					worktreePath,
+					worktreeId,
+					agentResponse: completion.agentResponse,
+					finishedAt: Date.now(),
+				};
+			}
 
 			// ----------------------------------------------------------- collect
 			const result = readResultFile(resultFile);
@@ -372,9 +401,6 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 			} else if (completion.reason === 'timeout') {
 				status = 'TIMEOUT';
 				error = `Card exceeded cardTimeoutMs (${config.cardTimeoutMs}ms) without a reported result.`;
-			} else if (completion.reason === 'interrupted') {
-				status = 'FAILED';
-				error = 'Orca reported the agent session was interrupted.';
 			} else {
 				const fallback = statusFromText(completion.agentResponse);
 				if (fallback) {
@@ -438,27 +464,31 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 				finishedAt: Date.now(),
 			};
 		} finally {
-			await closeSession({
-				orca,
-				orchestration,
-				config,
-				log: ctx.log,
-				card,
-				runId: ctx.runId,
-				sessionId,
-				aborted: ctx.signal.aborted,
-				orcaDispatchId,
-			});
+			// A handed-over card keeps everything: the terminal is the point, and the
+			// worktree holds the work in progress.
+			if (!handedOver) {
+				await closeSession({
+					orca,
+					orchestration,
+					config,
+					log: ctx.log,
+					card,
+					runId: ctx.runId,
+					sessionId,
+					aborted: ctx.signal.aborted,
+					orcaDispatchId,
+				});
 
-			if (createdWorktree && config.removeWorktreeOnSuccess && worktreePath) {
-				try {
-					await orca.worktreeRemove(`path:${worktreePath}`);
-				} catch (err) {
-					ctx.log.warn('failed to remove worktree', {
-						cardId: card.id,
-						runId: ctx.runId,
-						error: (err as Error).message,
-					});
+				if (createdWorktree && config.removeWorktreeOnSuccess && worktreePath) {
+					try {
+						await orca.worktreeRemove(`path:${worktreePath}`);
+					} catch (err) {
+						ctx.log.warn('failed to remove worktree', {
+							cardId: card.id,
+							runId: ctx.runId,
+							error: (err as Error).message,
+						});
+					}
 				}
 			}
 		}
@@ -556,8 +586,17 @@ async function waitForAgent(args: {
 	cardId: string;
 	runId: string;
 	startedAt: number;
+	/**
+	 * Set when re-attaching to a session that may ALREADY be sitting interrupted — a
+	 * card just taken back. Without this the watch reads that stale interrupt as a fresh
+	 * request for the keys and hands the card straight back, in a loop.
+	 */
+	resumed: boolean;
+	/** Re-read every tick, so a Take over click lands without Orca having to notice. */
+	lookupCard: (id: string) => Card | null;
 }): Promise<CompletionOutcome> {
-	const { orca, config, worktreeId, worktreePath, resultFile, signal, log, cardId, runId, startedAt } = args;
+	const { orca, config, worktreeId, worktreePath, resultFile, signal, log, cardId, runId, startedAt, resumed, lookupCard } =
+		args;
 	const deadline = startedAt + config.cardTimeoutMs;
 
 	let doneHits = 0;
@@ -566,9 +605,26 @@ async function waitForAgent(args: {
 	let missingRows = 0;
 	/** When Orca first insisted the agent was done, while no result file existed yet. */
 	let doneSince: number | null = null;
+	/**
+	 * Whether an `interrupted` agent should be read as "a human wants the keys".
+	 *
+	 * A fresh run arms at once: any interrupt during it is somebody pressing Esc. A
+	 * resumed run does not, because the session it re-attached to may still be sitting
+	 * on the interrupt that handed the card over in the first place — reading that as a
+	 * new request would bounce the card straight back to its owner, for ever.
+	 */
+	let interruptArmed = !resumed;
 
 	while (true) {
 		if (signal.aborted) return { reason: 'stopped', agentResponse: lastMessage, interrupted: false };
+
+		// Above the result-file check on purpose. An agent that finishes in the same tick
+		// you press Take over would otherwise settle the card and close the terminal out
+		// from under you — the click would be silently lost.
+		if (lookupCard(cardId)?.manualSince) {
+			return { reason: 'handed-over', agentResponse: lastMessage, interrupted: false };
+		}
+
 		if (readResultFile(resultFile)) return { reason: 'result-file', agentResponse: lastMessage, interrupted: false };
 		if (Date.now() >= deadline) return { reason: 'timeout', agentResponse: lastMessage, interrupted: false };
 
@@ -598,8 +654,15 @@ async function waitForAgent(args: {
 
 		if (agentInfo?.state) sawAgent = true;
 
-		if (agentInfo?.interrupted) {
-			return { reason: 'interrupted', agentResponse: lastMessage, interrupted: true };
+		// An agent Orca reports as NOT interrupted proves the session has moved past
+		// whatever interrupt handed this card over before, so a later one is genuinely new.
+		if (agentInfo && !agentInfo.interrupted) interruptArmed = true;
+
+		// A human hit Esc in the terminal. That is not a failure and it is not an
+		// outcome — it is a request for the keys. Hand the session over rather than
+		// closing it, which is what used to destroy the very work being rescued.
+		if (agentInfo?.interrupted && interruptArmed) {
+			return { reason: 'handed-over', agentResponse: lastMessage, interrupted: true };
 		}
 
 		const withinGrace = Date.now() - startedAt < config.startupGraceMs;

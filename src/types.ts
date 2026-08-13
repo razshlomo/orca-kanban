@@ -60,6 +60,15 @@ export type Card = {
    */
   notBefore: number | null;
   /**
+   * Epoch ms when a human took manual control of this card's live session.
+   *
+   * While set, the board stops supervising: no result-file settle, no idle settle,
+   * no timeout, and the Orca terminal is never closed. The card stays In Progress
+   * and keeps its slot, because the lane really is occupied — by you. Cleared by
+   * "take back", which restarts the board's watch on the same session.
+   */
+  manualSince: number | null;
+  /**
    * When set, reaching Done re-arms the card `repeatEveryMs` into the future
    * instead of leaving it finished — a recurring check that keeps one history.
    */
@@ -120,7 +129,11 @@ export type CardRun = {
 export type CardComment = {
 	id: string;
 	cardId: string;
-	/** `comment` is a plain note; `approved` and `rejected` are review verdicts. */
+	/**
+	 * `comment` is a plain note; `approved` and `rejected` are review verdicts.
+	 * Board-written entries (hand-over, hand-back) are plain comments authored by
+	 * `board`, which needs no schema change and reads correctly in the trail.
+	 */
 	kind: 'comment' | 'approved' | 'rejected';
 	author: string;
 	body: string;
@@ -155,17 +168,21 @@ export type AgentResultFile = {
 
 /** Everything the executor collected for one attempt. */
 export type ExecutionResult = {
-  status: AgentStatus | 'TIMEOUT';
+  /**
+   * `HANDED_OVER` is not an outcome the agent reports: it means a human took the
+   * session and the board stopped watching. Nothing is judged and nothing moves.
+   */
+  status: AgentStatus | 'TIMEOUT' | 'HANDED_OVER';
   /**
    * How the executor learned the agent had finished.
    *   agent-done   - Orca reported agents[].state === 'done' (native, preferred)
    *   result-file  - the agent's result JSON appeared and parsed
-   *   interrupted  - Orca reported the agent was interrupted
+   *   handed-over  - a human interrupted the agent, or pressed Take over
    *   gone         - the worktree/agent vanished from Orca
    *   timeout      - cardTimeoutMs elapsed
    *   stopped      - operator aborted the card
    */
-  completionReason: 'agent-done' | 'result-file' | 'interrupted' | 'gone' | 'timeout' | 'stopped';
+  completionReason: 'agent-done' | 'result-file' | 'handed-over' | 'gone' | 'timeout' | 'stopped';
   sessionId: string | null;
   runId: string;
   branch: string | null;
@@ -316,6 +333,8 @@ export type BoardEvent =
   | 'retry_scheduled'
   | 'scheduler_idle'
   | 'card_recovered'
+  | 'card_handed_over'
+  | 'card_taken_back'
   | 'session_closed'
   | 'board_changed'
   | 'scheduler_state';

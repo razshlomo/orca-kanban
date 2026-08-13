@@ -12,6 +12,9 @@ board", "queue this", "break this into cards", or asks what is on the board, use
 - Read the board: `kanban card list`, `kanban card show <id>`, `kanban status`.
 - Run it: `kanban run --once` (one card) or `kanban serve` (board UI + auto-run).
 - Fix stuck work: `kanban card retry <id>`, `kanban card move <id> <state>`, `kanban recover`.
+- `kanban card takeover <id>` hands a running agent’s session to a human; the card then
+  stays In Progress with no timers until `kanban card takeback <id>`. A card listed as
+  `yours` in `kanban status` is deliberately held — leave it alone.
 - `kanban card resume <id>` reopens a finished card's agent conversation (stored per
   worktree), so a closed terminal is not a dead end during review.
 - A schedule needs `--state Ready`: a date on a Backlog card never fires, because
