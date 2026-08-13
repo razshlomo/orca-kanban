@@ -3,6 +3,7 @@ import { createApp } from './app.ts';
 import { BoardRuleError, schedulerLiveness } from './board.ts';
 import { gitReviewDiff } from './git.ts';
 import { describeLanding, landCardWork } from './land.ts';
+import { describeResume, resumeCardSession } from './resume.ts';
 import { formatRelative, parseDueAt, parseDuration } from './text.ts';
 import { assertBoardWritable, CardWorkerGuardError } from './guard.ts';
 import { createHttpServer } from './server.ts';
@@ -25,7 +26,7 @@ Usage:
   orca-kanban card comment <id> <text>           Add a note to the card's review trail
   orca-kanban card diff <id>                     Show the card's changes, untracked included
   orca-kanban card open <id> [--session]         Open the changes (or session) in Orca
-  orca-kanban card snooze <id> <7d|2026-08-19>   Defer a card until it is due
+  orca-kanban card resume <id>                   Reopen the agent's conversation for a card
   orca-kanban recover                            Reconcile cards stranded In Progress
   orca-kanban status                             Show board + scheduler status
   orca-kanban doctor                             Check Orca connectivity and config
@@ -118,10 +119,28 @@ async function main(): Promise<number> {
 		const server = createHttpServer(app);
 		const { promise, resolve } = Promise.withResolvers<number>();
 
-		server.listen(app.config.port, () => {
-			process.stdout.write(`Orca Kanban board:  http://localhost:${app.config.port}\n`);
-			process.stdout.write(`Auto-run: ${app.config.autoRun ? 'on' : 'off'} · agent: ${app.config.defaultAgent}\n`);
+		// Bind BEFORE starting the scheduler. `scheduler.start` stamps this process's pid
+		// into scheduler_state, so a serve that never got the port would claim ownership of
+		// a healthy board and then die, leaving `kanban status` pointing at a dead pid.
+		const bound = await new Promise<Error | null>((done) => {
+			server.once('error', (err: Error) => done(err));
+			server.listen(app.config.port, () => done(null));
 		});
+
+		if (bound) {
+			const taken = (bound as NodeJS.ErrnoException).code === 'EADDRINUSE';
+			process.stderr.write(
+				taken
+					? `Port ${app.config.port} is already in use — another board is probably running.\n` +
+							`Check with: kanban status · or serve elsewhere: kanban serve --port ${app.config.port + 1}\n`
+					: `Could not start the board: ${bound.message}\n`,
+			);
+			app.close();
+			return 1;
+		}
+
+		process.stdout.write(`Orca Kanban board:  http://localhost:${app.config.port}\n`);
+		process.stdout.write(`Auto-run: ${app.config.autoRun ? 'on' : 'off'} · agent: ${app.config.defaultAgent}\n`);
 
 		// The loop always runs; autoRun decides whether it picks cards up.
 		app.scheduler.start({ autoRun: app.config.autoRun });
@@ -237,10 +256,17 @@ async function main(): Promise<number> {
 					// The reason matters more than the mark: a Ready card sitting still is
 					// either due later, out of retries, or waiting on somebody else.
 					const why = eligible.has(c.id) ? '' : (app.board.whyNotRunnable(c) ?? '');
+					// A card parked on a human needs its age, not its eligibility: that is the
+					// question you are actually asking when you look at the Review column.
+					const waiting =
+						c.state === 'Review' || c.state === 'Blocked'
+							? `waiting ${formatRelative(c.stateChangedAt).replace(' ago', '')}`
+							: '';
+					const note = [waiting, why].filter(Boolean).join(', ');
 					process.stdout.write(
 						`${c.id}  ${c.state.padEnd(11)} P${String(c.priority).padEnd(4)} ` +
 							`${eligible.has(c.id) ? '✓' : ' '} ${c.attemptCount}/${c.maxAttempts}  ${c.title}` +
-							`${why === '' ? '' : `  (${why})`}\n`,
+							`${note === '' ? '' : `  (${note})`}\n`,
 					);
 				}
 				return 0;
@@ -359,6 +385,25 @@ async function main(): Promise<number> {
 				const selector = card.worktreeId ? `id:${card.worktreeId}` : `path:${card.worktreePath}`;
 				await app.orca.fileOpenChanged({ worktreeSelector: selector, mode: 'diff' });
 				process.stdout.write(`opened this card's changed files in Orca\n`);
+				return 0;
+			}
+
+			if (sub === 'resume') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+				const card = app.board.getCard(id);
+				if (!card) throw new Error(`no such card ${id}`);
+
+				const outcome = await resumeCardSession(card, app.config, app.orca);
+				if (!outcome.resumed) throw new Error(`cannot resume ${id}: ${describeResume(outcome)}`);
+
+				app.board.attachSession(id, {
+					sessionId: outcome.sessionId,
+					worktreeId: card.worktreeId,
+					worktreePath: card.worktreePath,
+					branch: card.branch,
+				});
+				process.stdout.write(`${id} -> ${outcome.command} in ${outcome.sessionId}\n`);
 				return 0;
 			}
 

@@ -48,6 +48,11 @@ export type Card = {
   agent: string | null;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Epoch ms of the last state transition. Unlike `updatedAt`, renaming a card does not
+   * move it, so this is what answers "how long has this been waiting for review".
+   */
+  stateChangedAt: number;
 
   /**
    * Epoch ms before which this card must not run. `null` means runnable now.
@@ -193,6 +198,15 @@ export type AgentConfig = {
    * / `{{prompt}}` are substituted.
    */
   fallbackCommand: string | null;
+  /**
+   * Shell command that reopens this agent's previous conversation for a card, run in
+   * the card's own worktree. OMP keys its session store by working directory, so
+   * `omp --continue` there resumes exactly that card's history — which is why closing
+   * the terminal when a card settles loses nothing.
+   *
+   * `null` for agents with no resume story; the UI disables the button and says so.
+   */
+  resumeCommand: string | null;
 };
 
 export type KanbanConfig = {

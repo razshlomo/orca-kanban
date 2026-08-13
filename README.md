@@ -562,9 +562,41 @@ for the card's state is open when it opens:
 | --- | --- | --- |
 | The work | title, description, acceptance criteria | always |
 | How it runs | priority, order, tries, repo, agent, dependencies, schedule, retry/stop/delete | no |
-| Review | agent summary, diff, verdict, review trail | when the card is in Review or Blocked |
+| Review | agent summary, diff, **Resume conversation**, verdict, review trail | when the card is in Review or Blocked |
 | Runs and technical | run history, worktree, session, commit | no |
 
+### Reopening the agent conversation
+
+A card's Orca terminal closes when the card settles (`closeSessionWhenDone`), because one
+dead terminal per card would bury Orca. The conversation is not lost: OMP keys its session
+store by working directory, and every card runs in its own worktree.
+
+So **Resume conversation** in the card panel opens a fresh Orca terminal in that worktree
+running `omp --continue`, which reopens that card's history and no other:
+
+```
+kanban card resume <id>
+```
+
+Configured per agent, so a different CLI can be resumed its own way:
+
+```json
+{ "agents": { "omp": { "resumeCommand": "omp --continue" } } }
+```
+
+Set it to `null` for an agent with no resume story — the button then disables itself and
+says which agent lacks one. Defaults ship for `omp`, `claude` and `codex`.
+
+### How long has this been waiting
+
+`stateChangedAt` records the moment a card last changed column, which `updatedAt` cannot:
+renaming a card bumps `updatedAt` but tells you nothing about how long a review has been
+sitting. Cards in **Review** and **Blocked** therefore show their age, and those two
+columns sort oldest-first so the longest wait is on top:
+
+```
+card_18374d02  Review  P10  1/2  Verify the Slack cost alerts fired  (waiting 53m)
+```
 **One Save.** It persists everything editable, schedule included — there is no separate
 "save the repeat" or "apply the hold". The button is disabled until something actually
 changes, then reads `Unsaved changes` → `Saving…` → `Saved`, and a failure shows the
@@ -636,7 +668,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 163 tests
+npm test          # 175 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```

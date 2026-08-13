@@ -87,6 +87,9 @@ function rowToCard(row: Row): Card {
 		agent: (row['agent'] as string | null) ?? null,
 		createdAt: Number(row['created_at']),
 		updatedAt: Number(row['updated_at']),
+		// Seeded from updated_at by the v4 migration, so it is never null in practice; the
+		// fallback keeps a hand-inserted row from producing NaN.
+		stateChangedAt: Number(row['state_changed_at'] ?? row['updated_at']),
 		notBefore: row['not_before'] === null || row['not_before'] === undefined ? null : Number(row['not_before']),
 		repeatEveryMs:
 			row['repeat_every_ms'] === null || row['repeat_every_ms'] === undefined ? null : Number(row['repeat_every_ms']),

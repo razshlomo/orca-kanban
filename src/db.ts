@@ -123,6 +123,36 @@ const MIGRATIONS: string[] = [
 	   reporting the oldest of them so existing readers are unaffected. */
 	ALTER TABLE scheduler_state ADD COLUMN in_flight TEXT NOT NULL DEFAULT '[]';
 	`,
+
+	// v4 — when a card last changed column.
+	`
+	/* Epoch ms of the last STATE transition, as opposed to updated_at which moves on any
+	   edit. This is what answers "how long has this been sitting in Review". Existing rows
+	   seed from updated_at: imprecise for old cards, but never null and never in the future. */
+	ALTER TABLE cards ADD COLUMN state_changed_at INTEGER;
+	UPDATE cards SET state_changed_at = updated_at WHERE state_changed_at IS NULL;
+
+	/* Eight separate statements move a card between columns — claim, move, retry, snooze,
+	   re-arm and three result paths — and more will be added. Triggers keep the stamp
+	   correct without every future write path having to remember it.
+
+	   julianday gives millisecond precision; strftime('%s') would only give seconds.
+	   Recursive triggers are off by default, and the WHEN guard makes a same-state write
+	   a no-op regardless. */
+	CREATE TRIGGER cards_state_changed AFTER UPDATE OF state ON cards
+	WHEN old.state <> new.state
+	BEGIN
+		UPDATE cards
+		SET state_changed_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+		WHERE id = new.id;
+	END;
+
+	CREATE TRIGGER cards_state_inserted AFTER INSERT ON cards
+	WHEN new.state_changed_at IS NULL
+	BEGIN
+		UPDATE cards SET state_changed_at = new.created_at WHERE id = new.id;
+	END;
+	`,
 ];
 
 /**

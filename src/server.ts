@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gitReviewDiff } from './git.ts';
 import { landCardWork } from './land.ts';
+import { describeResume, resumeCardSession } from './resume.ts';
 import { parseDueAt } from './text.ts';
 import { BoardRuleError, schedulerLiveness } from './board.ts';
 import type { App } from './app.ts';
@@ -93,6 +94,11 @@ function stateSnapshot(app: App): Record<string, unknown> {
 			pollIntervalMs: app.config.pollIntervalMs,
 			maxConcurrent: app.config.maxConcurrent,
 			agents: Object.keys(app.config.agents),
+			// The UI needs to know which agents can reopen a conversation, so it can disable
+			// the button with a reason rather than failing on click.
+			resumableAgents: Object.entries(app.config.agents)
+				.filter(([, a]) => a.resumeCommand)
+				.map(([name]) => name),
 			mirrorToOrcaBoard: app.config.mirrorToOrcaBoard,
 			orchestrationEnabled: app.config.orchestration.enabled,
 		},
@@ -197,6 +203,25 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 			const retried = app.board.retryCard(id, { resetAttempts });
 			if (retried) await app.mirrorCard(retried, 'retry requested');
 			send(res, 200, { card: retried });
+			return;
+		}
+
+		if (action === '/resume' && method === 'POST') {
+			const card = app.board.getCard(id);
+			if (!card) return send(res, 404, { error: `no such card ${id}` });
+
+			const outcome = await resumeCardSession(card, app.config, app.orca);
+			if (!outcome.resumed) {
+				return send(res, 409, { error: describeResume(outcome), reason: outcome.reason });
+			}
+			// Point the card at the reopened terminal so Open session works again.
+			const updated = app.board.attachSession(id, {
+				sessionId: outcome.sessionId,
+				worktreeId: card.worktreeId,
+				worktreePath: card.worktreePath,
+				branch: card.branch,
+			});
+			send(res, 200, { card: updated, sessionId: outcome.sessionId, command: outcome.command });
 			return;
 		}
 

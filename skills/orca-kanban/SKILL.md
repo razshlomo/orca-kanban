@@ -163,6 +163,13 @@ is never picked up, so the card stays parked even after the date passes. Ready p
 `(waiting on card_x)`, `(no retries left)` — so check there before assuming a card
 is stuck.
 
+## Reopening an agent conversation
+
+A finished card's Orca terminal is closed, but its conversation is not gone: OMP stores
+sessions per worktree, so `kanban card resume <id>` reopens that card's history in a new
+terminal. Use it when the human asks what an agent actually did, instead of guessing from
+the diff.
+
 ## Review is the human's call, not yours
 
 A finished card stops in **Review**. `kanban card approve` and `kanban card reject`

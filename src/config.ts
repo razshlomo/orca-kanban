@@ -17,12 +17,18 @@ export function kanbanHome(): string {
  * agent-first path and delivers the prompt without touching the TUI.
  */
 export const DEFAULT_AGENTS: Record<string, AgentConfig> = {
-	omp: { orcaAgentId: 'omp', fallbackCommand: 'omp --auto-approve {{promptFileRel}}' },
-	codex: { orcaAgentId: 'codex', fallbackCommand: null },
-	claude: { orcaAgentId: 'claude', fallbackCommand: null },
-	cursor: { orcaAgentId: 'cursor', fallbackCommand: null },
-	opencode: { orcaAgentId: 'opencode', fallbackCommand: null },
-	pi: { orcaAgentId: 'pi', fallbackCommand: null },
+	// `--continue` resumes the newest session for the current directory, and every card
+	// runs in its own worktree, so this reopens that card's conversation and no other.
+	omp: {
+		orcaAgentId: 'omp',
+		fallbackCommand: 'omp --auto-approve {{promptFileRel}}',
+		resumeCommand: 'omp --continue',
+	},
+	codex: { orcaAgentId: 'codex', fallbackCommand: null, resumeCommand: 'codex resume --last' },
+	claude: { orcaAgentId: 'claude', fallbackCommand: null, resumeCommand: 'claude --continue' },
+	cursor: { orcaAgentId: 'cursor', fallbackCommand: null, resumeCommand: null },
+	opencode: { orcaAgentId: 'opencode', fallbackCommand: null, resumeCommand: null },
+	pi: { orcaAgentId: 'pi', fallbackCommand: null, resumeCommand: null },
 };
 
 /**

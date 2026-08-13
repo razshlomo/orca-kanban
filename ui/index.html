@@ -122,6 +122,23 @@
 			.runs div { border-bottom: 1px solid var(--border); padding: 5px 0; }
 			.hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
 			.hint.warn { color: var(--warn); }
+			/* What the agent wrote, treated as prose rather than machine output: body font,
+			   generous line-height, real bullets, and a tall cap so a summary is readable in
+			   place instead of through a 220px monospace slot. */
+			.prose {
+				background: var(--bg); border: 1px solid var(--border); border-radius: 5px;
+				padding: 9px 11px; font-size: 12px; line-height: 1.55; color: var(--text);
+				max-height: 340px; overflow: auto; overflow-wrap: break-word;
+			}
+			.prose.bad { color: var(--bad); }
+			.prose p { margin: 0 0 8px; }
+			.prose p:last-child, .prose ul:last-child { margin-bottom: 0; }
+			.prose ul { margin: 0 0 8px; padding-left: 17px; }
+			.prose li { margin: 0 0 3px; }
+			.prose code {
+				background: var(--panel-2); border: 1px solid var(--border); border-radius: 3px;
+				padding: 0 3px; font-size: 11px; font-family: ui-monospace, SFMono-Regular, monospace;
+			}
 			.close { position: absolute; top: 9px; right: 10px; }
 			kbd {
 				background: var(--panel-2); border: 1px solid var(--border); border-radius: 3px;
@@ -177,6 +194,51 @@
 			};
 
 			const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+			/**
+			 * Agent summaries are prose, not machine output: paragraphs, `-` bullets and
+			 * backticked identifiers. Rendering them in the same monospace block used for file
+			 * paths is what made them unreadable, so give them real text treatment.
+			 *
+			 * Deliberately tiny: escape everything first, then re-introduce only inline code,
+			 * bullets and paragraph breaks. No HTML from an agent is ever trusted.
+			 */
+			function prose(text) {
+				const BULLET = /^\s*[-*•]\s+/;
+				const code = (s) => s.replace(/`([^`]+)`/g, '<code>$1</code>');
+				const lines = esc(String(text ?? '').trim()).split('\n');
+
+				const out = [];
+				let paragraph = [];
+				let bullets = [];
+
+				const flushParagraph = () => {
+					if (paragraph.length) out.push(`<p>${code(paragraph.join('<br>'))}</p>`);
+					paragraph = [];
+				};
+				const flushBullets = () => {
+					if (bullets.length) out.push(`<ul>${bullets.map((b) => `<li>${code(b)}</li>`).join('')}</ul>`);
+					bullets = [];
+				};
+
+				for (const line of lines) {
+					if (BULLET.test(line)) {
+						// A lead-in line like "Changed:" ends the paragraph and starts the list,
+						// which is the shape almost every agent summary actually uses.
+						flushParagraph();
+						bullets.push(line.replace(BULLET, ''));
+					} else if (line.trim() === '') {
+						flushBullets();
+						flushParagraph();
+					} else {
+						flushBullets();
+						paragraph.push(line);
+					}
+				}
+				flushBullets();
+				flushParagraph();
+				return out.join('');
+			}
 
 			/** Compact "in 6d" for scheduled cards; mirrors formatRelative in src/text.ts. */
 			const rel = (at) => {
@@ -253,7 +315,16 @@
 				const board = document.getElementById('board');
 				board.innerHTML = '';
 				for (const state of STATES) {
-					const cards = snapshot.cards.filter((c) => c.state === state).sort((a, b) => b.priority - a.priority || a.order - b.order);
+					// Review and Blocked are queues of work waiting on a human, so the one that has
+					// waited longest belongs on top. Everywhere else, priority is what decides.
+					const waiting = state === 'Review' || state === 'Blocked';
+					const cards = snapshot.cards
+						.filter((c) => c.state === state)
+						.sort((a, b) =>
+							waiting
+								? a.stateChangedAt - b.stateChangedAt
+								: b.priority - a.priority || a.order - b.order,
+						);
 					const col = document.createElement('div');
 					col.className = 'col';
 					col.dataset.state = state;
@@ -287,6 +358,7 @@
 					`<div class="t">${esc(c.title)}</div>
 					<div class="meta">
 						<span class="tag p">P${c.priority}</span>
+						${c.state === 'Review' || c.state === 'Blocked' ? `<span class="tag" style="color:var(--warn)" title="Entered ${esc(c.state)} on ${new Date(c.stateChangedAt).toLocaleString()}">waiting ${rel(c.stateChangedAt).replace(' ago', '')}</span>` : ''}
 						${c.dependencies.length ? `<span class="tag">deps ${c.dependencies.length}</span>` : ''}
 						${c.attemptCount ? `<span class="tag">try ${c.attemptCount}/${c.maxAttempts}</span>` : ''}
 						${eligible ? '<span class="tag" style="color:var(--ok)">eligible</span>' : ''}
@@ -386,13 +458,19 @@
 					verdict: reviewable,
 					openChanges: Boolean(c.worktreePath),
 					openSession: running && Boolean(c.sessionId),
+					// The transcript lives on disk keyed by the worktree, so a closed terminal is
+					// not a dead end: a worktree plus a resume-capable agent is all it takes.
+					resume: Boolean(c.worktreePath) && Boolean(resumeCommandFor(c)),
 				};
 				const why = {
 					retry: running ? 'Stop the card first' : 'Nothing has been attempted yet',
 					destroy: 'Stop the card before deleting it',
 					verdict: `Only a card in Review or Blocked has a result to judge — this one is in ${c.state}`,
 					openChanges: 'This card has never run, so there are no changes',
-					openSession: c.sessionId ? 'The session is closed; open the changes instead' : 'This card has no session',
+					openSession: c.sessionId ? 'The session is closed — use Resume conversation' : 'This card has no session',
+					resume: !c.worktreePath
+						? 'This card has never run, so there is no conversation'
+						: `${esc(c.agent || snapshot.config.defaultAgent)} has no resume command configured`,
 				};
 				try { runs = (await api(`/api/cards/${encodeURIComponent(c.id)}/runs`)).runs; } catch {}
 				try { comments = (await api(`/api/cards/${encodeURIComponent(c.id)}/comments`)).comments; } catch {}
@@ -401,17 +479,17 @@
 				const open = (name, fallback) => (openGroups[name] ?? fallback) ? 'open' : '';
 				const held = c.notBefore && c.notBefore > Date.now();
 
-				document.getElementById('panelHead').innerHTML = `
+				const nextHead = `
 					<h2>${esc(c.title)}</h2>
 					<div class="meta">
-						<span class="tag">${esc(c.state)}</span>
+						<span class="tag" title="Entered ${esc(c.state)} on ${new Date(c.stateChangedAt).toLocaleString()}">${esc(c.state)} · ${rel(c.stateChangedAt)}</span>
 						<span class="tag p">P${c.priority}</span>
 						${c.attemptCount ? `<span class="tag">try ${c.attemptCount}/${c.maxAttempts}</span>` : ''}
 						${!eligibleNow(c) && c.heldBecause ? `<span class="tag" style="color:var(--warn)">${esc(c.heldBecause)}</span>` : ''}
 						<span class="tag">${esc(c.id)}</span>
 					</div>`;
 
-				document.getElementById('panelBody').innerHTML = `
+				const nextBody = `
 					<details class="group" data-g="work" ${open('work', true)}>
 						<summary>The work</summary>
 						<div class="group-body">
@@ -464,14 +542,15 @@
 					<details class="group" data-g="review" ${open('review', reviewable)}>
 						<summary>Review<span class="n">${reviewable ? 'your call' : esc(c.lastResult || 'not run')}</span></summary>
 						<div class="group-body">
-							${c.lastAgentSummary ? `<label>What the agent said</label><pre style="color:var(--text)">${esc(c.lastAgentSummary)}</pre>` : ''}
-							${c.lastError ? `<label>Last error</label><pre style="color:var(--bad)">${esc(c.lastError)}</pre>` : ''}
+							${c.lastAgentSummary ? `<label>What the agent said</label><div class="prose" data-scroll="summary">${prose(c.lastAgentSummary)}</div>` : ''}
+							${c.lastError ? `<label>Last error</label><div class="prose bad" data-scroll="error">${prose(c.lastError)}</div>` : ''}
 							<div class="actions" style="margin-top:0">
 								<button ${can.openChanges ? '' : `disabled title="${esc(why.openChanges)}"`} onclick="openInOrca('changes')">Open in Orca</button>
 								<button ${can.openSession ? '' : `disabled title="${esc(why.openSession)}"`} onclick="openInOrca('session')">Open session</button>
+								<button ${can.resume ? '' : `disabled title="${esc(why.resume)}"`} onclick="resumeSession()">Resume conversation</button>
 								${can.openChanges ? `<button onclick="loadDiff()">${diffCache.cardId === c.id ? 'Reload' : 'Show'} diff</button>` : ''}
 							</div>
-							${diffCache.cardId === c.id ? `<pre style="max-height:300px;color:var(--text)">${esc(diffCache.text)}</pre>` : ''}
+							${diffCache.cardId === c.id ? `<pre data-scroll="diff" style="max-height:300px;color:var(--text)">${esc(diffCache.text)}</pre>` : ''}
 							${c.commitSha ? `<div class="hint">Committed as <code>${esc(c.commitSha.slice(0, 8))}</code>.</div>` : can.openChanges ? '<div class="hint warn">Not committed — approving commits it on this card\u2019s branch.</div>' : ''}
 							${can.verdict ? `
 								<label for="f-comment">Your verdict</label>
@@ -508,23 +587,50 @@
 						</div>
 					</details>`;
 
-				// Remember only what the USER opened. Chrome queues a `toggle` event for a
-				// details that is inserted already open, so listening to `toggle` made the
-				// auto-opened Review section leak onto every card clicked afterwards.
-				for (const d of document.querySelectorAll('#panelBody details.group')) {
-					d.querySelector('summary').addEventListener('click', () => { openGroups[d.dataset.g] = !d.open; });
-				}
-				// Every edit re-evaluates the footer, so "Unsaved changes" appears as you type.
-				for (const el of document.querySelectorAll('#panelBody input, #panelBody textarea, #panelBody select')) {
-					el.addEventListener('input', () => renderFooter());
-					el.addEventListener('change', () => renderFooter());
+				const headEl = document.getElementById('panelHead');
+				const bodyEl = document.getElementById('panelBody');
+				if (headEl.innerHTML !== nextHead) headEl.innerHTML = nextHead;
+
+				// Only touch the body when the markup genuinely differs. Rewriting it on every
+				// 1.5s poll destroyed and rebuilt every child, which threw away the scroll
+				// position inside the agent summary — so reading anything long was impossible.
+				if (bodyEl.innerHTML !== nextBody) {
+					// A redraw that IS needed must not lose the reader's place either.
+					const scrolls = [...bodyEl.querySelectorAll('[data-scroll]')].map((e) => [e.dataset.scroll, e.scrollTop]);
+					bodyEl.innerHTML = nextBody;
+
+					for (const [key, top] of scrolls) {
+						const el = bodyEl.querySelector(`[data-scroll="${key}"]`);
+						if (el) el.scrollTop = top;
+					}
+
+					// Remember only what the USER opened. Chrome queues a `toggle` event for a
+					// details that is inserted already open, so listening to `toggle` made the
+					// auto-opened Review section leak onto every card clicked afterwards.
+					for (const d of bodyEl.querySelectorAll('details.group')) {
+						d.querySelector('summary').addEventListener('click', () => { openGroups[d.dataset.g] = !d.open; });
+					}
+					// Every edit re-evaluates the footer, so "Unsaved changes" appears as you type.
+					for (const el of bodyEl.querySelectorAll('input, textarea, select')) {
+						el.addEventListener('input', () => renderFooter());
+						el.addEventListener('change', () => renderFooter());
+					}
+					baseline = formValues();
 				}
 
-				baseline = formValues();
+				// Reselecting the same card produces identical markup, so the block above may
+				// not run. Without this the form would have no baseline and Save would never
+				// light up.
+				if (!baseline) baseline = formValues();
+
 				renderFooter(lastSaveMsg?.text, lastSaveMsg?.tone);
 			}
 
 			const eligibleNow = (c) => (snapshot.eligible || []).includes(c.id);
+
+			/** Whether this card’s agent can reopen its conversation. */
+			const resumeCommandFor = (c) =>
+				(snapshot.config.resumableAgents || []).includes(c.agent || snapshot.config.defaultAgent);
 
 			/** Milliseconds back into the shortest thing a person would have typed. */
 			function humanDuration(ms) {
@@ -604,7 +710,28 @@
 				if (!isDirty()) return;
 				lastSaveMsg = null;
 				baseline = null;
+				// Typing changes an input’s value PROPERTY, not its attribute, so the markup
+				// comparison in renderPanel cannot see the edits. Emptying the body forces the
+				// rewrite that actually discards them.
+				document.getElementById("panelBody").innerHTML = "";
 				renderPanel();
+			}
+
+			/**
+			 * Reopens the agent conversation for this card in a fresh Orca terminal. The
+			 * transcript is stored per worktree, so a closed tab lost nothing.
+			 */
+			async function resumeSession() {
+				renderFooter("Reopening…");
+				let out;
+				try {
+					out = await api(`/api/cards/${encodeURIComponent(selectedId)}/resume`, "POST", {});
+				} catch (e) {
+					return reportSave(e.message, "bad");
+				}
+				baseline = null;
+				await refresh();
+				reportSave(`Reopened with ${out.command}`, "ok");
 			}
 
 			async function retryCard() {

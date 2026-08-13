@@ -13,3 +13,6 @@ scheduler.log
 .orca-kanban/
 
 .DS_Store
+
+# omp writes a session export here when a resumed terminal is closed.
+omp-session-*.html

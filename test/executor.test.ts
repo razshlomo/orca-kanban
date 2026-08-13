@@ -22,6 +22,7 @@ function card(over: Partial<Card> = {}): Card {
 		agent: null,
 		createdAt: now,
 		updatedAt: now,
+		stateChangedAt: now,
 		notBefore: null,
 		repeatEveryMs: null,
 		claimedAt: now,
