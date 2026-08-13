@@ -547,14 +547,32 @@ kanban recover        # or POST /api/scheduler/recover
 
 `kanban serve` → <http://localhost:7420>
 
-Six columns with drag-and-drop, card create/edit/delete, priority and order,
-dependencies, agent and repo per card, retry, run history, live scheduler status with the
-current card and Orca session id, and all five scheduler controls. The auto-run button is
-a toggle that reflects the scheduler's real state rather than a fixed label.
+Six columns with drag-and-drop, live scheduler status, and all five scheduler controls.
+The auto-run button is a toggle that reflects the scheduler's real state rather than a
+fixed label, and every control that cannot apply is disabled with the reason as its
+tooltip.
 
-Selecting a card opens a review panel: an inline diff of what the agent produced,
-**Open changes in Orca** and **Open session** buttons, a comment box, **Approve** and
-**Request changes**, and the card's append-only review trail.
+### The card panel
+
+Selecting a card opens a panel with a fixed header, a scrolling body, and one action bar
+that never scrolls away. Four collapsible sections keep it short, and the one that matters
+for the card's state is open when it opens:
+
+| Section | Holds | Open by default |
+| --- | --- | --- |
+| The work | title, description, acceptance criteria | always |
+| How it runs | priority, order, tries, repo, agent, dependencies, schedule, retry/stop/delete | no |
+| Review | agent summary, diff, verdict, review trail | when the card is in Review or Blocked |
+| Runs and technical | run history, worktree, session, commit | no |
+
+**One Save.** It persists everything editable, schedule included — there is no separate
+"save the repeat" or "apply the hold". The button is disabled until something actually
+changes, then reads `Unsaved changes` → `Saving…` → `Saved`, and a failure shows the
+server's reason in the same place. **Revert** restores the card as the board has it.
+
+Unsaved work is safe: the 1.5s poll refuses to redraw a panel with pending edits, and
+switching cards, closing the panel, or reloading the page asks first. Verdicts report
+through the same footer, so there is one place to look for "did that work".
 
 It is otherwise intentionally minimal: Orca's own workspace board already shows each
 card's column, progress comment, and agent, so this UI only adds what Orca has no
@@ -618,7 +636,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 154 tests
+npm test          # 163 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```

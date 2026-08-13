@@ -40,7 +40,6 @@
 			button.danger { color: var(--bad); }
 			button.ok { color: var(--ok); }
 			button:disabled { opacity: .45; cursor: not-allowed; }
-			.review { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 6px; }
 			.trail div { border-bottom: 1px solid var(--border); padding: 5px 0; font-size: 11px; }
 			.trail .k { font-weight: 600; }
 			.trail .k.rejected { color: var(--bad); }
@@ -67,19 +66,54 @@
 			.tag { background: #22222a; border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
 			.tag.p { color: var(--accent); }
 			.tag.err { color: var(--bad); }
+			/* The panel is a form, so it gets a form's shape: a fixed identity strip at the
+			   top, one scrolling body, and one action bar pinned at the bottom. The Save
+			   button must never scroll out of reach. */
 			aside {
-				position: fixed; top: 0; right: 0; width: 400px; height: 100vh; overflow: auto;
-				background: var(--panel); border-left: 1px solid var(--border); padding: 14px; z-index: 20;
+				position: fixed; top: 0; right: 0; width: min(440px, 100vw); height: 100vh;
+				background: var(--panel); border-left: 1px solid var(--border); z-index: 20;
+				display: flex; flex-direction: column;
 			}
 			aside.hidden { display: none; }
+			.p-head { padding: 11px 14px; border-bottom: 1px solid var(--border); }
+			.p-head h2 { font-size: 13px; margin: 0 22px 4px 0; line-height: 1.35; word-break: break-word; }
+			.p-body { flex: 1; overflow: auto; padding: 0 14px 16px; }
+			.p-foot {
+				border-top: 1px solid var(--border); background: var(--panel-2);
+				padding: 9px 14px; display: flex; gap: 9px; align-items: center;
+			}
+			.p-foot .msg { font-size: 11px; color: var(--muted); }
+			.p-foot .msg.ok { color: var(--ok); }
+			.p-foot .msg.bad { color: var(--bad); }
+
+			/* Sections keep the pane short: only what the card's state calls for is open. */
+			details.group { border-bottom: 1px solid var(--border); }
+			details.group > summary {
+				cursor: pointer; padding: 9px 0; margin: 0; font-size: 11px; font-weight: 600;
+				text-transform: uppercase; letter-spacing: .6px; color: var(--muted); list-style: none;
+				display: flex; align-items: center; gap: 6px;
+			}
+			details.group > summary::-webkit-details-marker { display: none; }
+			details.group > summary::before { content: '▸'; font-size: 9px; transition: transform .15s; }
+			details.group[open] > summary::before { transform: rotate(90deg); }
+			details.group > summary:hover { color: var(--text); }
+			details.group > summary .n { margin-left: auto; font-weight: 400; letter-spacing: 0; text-transform: none; }
+			.group-body { padding: 0 0 12px; }
+
 			label { display: block; font-size: 11px; color: var(--muted); margin: 8px 0 3px; }
 			input, textarea, select {
 				width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
 				border-radius: 5px; padding: 6px; font: inherit;
 			}
-			textarea { min-height: 66px; resize: vertical; }
+			input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+			textarea { min-height: 62px; resize: vertical; }
+			/* Fixed columns wrap into a grid instead of squeezing three number fields into
+			   a 400px pane, which is what made this unreadable. */
+			.grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); }
 			.row { display: flex; gap: 8px; }
 			.row > * { flex: 1; }
+			.actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+			.actions button { flex: 0 1 auto; }
 			pre {
 				background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 8px;
 				white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; font-size: 11px; color: var(--muted);
@@ -87,7 +121,12 @@
 			.runs { font-size: 11px; }
 			.runs div { border-bottom: 1px solid var(--border); padding: 5px 0; }
 			.hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
-			.close { float: right; }
+			.hint.warn { color: var(--warn); }
+			.close { position: absolute; top: 9px; right: 10px; }
+			kbd {
+				background: var(--panel-2); border: 1px solid var(--border); border-radius: 3px;
+				padding: 0 4px; font: inherit; font-size: 10px;
+			}
 		</style>
 	</head>
 	<body>
@@ -109,16 +148,20 @@
 		<div class="board" id="board"></div>
 
 		<aside id="panel" class="hidden">
-			<button class="close" onclick="closePanel()">close</button>
-			<div id="panelBody"></div>
+			<button class="close" onclick="closePanel()" title="Close (Esc)">close</button>
+			<div class="p-head" id="panelHead"></div>
+			<div class="p-body" id="panelBody"></div>
+			<div class="p-foot">
+				<button class="primary" id="saveBtn" onclick="saveCard()">Save changes</button>
+				<button id="revertBtn" onclick="revertCard()">Revert</button>
+				<span class="msg" id="saveMsg"></span>
+			</div>
 		</aside>
-
 		<script>
 			const STATES = ['Backlog', 'Ready', 'In Progress', 'Review', 'Done', 'Blocked'];
 			let snapshot = { cards: [], scheduler: {}, config: {}, eligible: [] };
 			let selectedId = null;
 			let dragId = null;
-			let editing = false;
 
 			const api = async (url, method = 'GET', body) => {
 				const res = await fetch(url, {
@@ -230,7 +273,9 @@
 					});
 					board.appendChild(col);
 				}
-				if (selectedId && !editing) renderPanel();
+				// Never redraw over unsaved edits: the old focus/blur guard dropped them the
+				// moment you clicked away, which silently lost typing every 1.5 seconds.
+				if (selectedId && !isDirty() && !saving) renderPanel();
 			}
 
 			function cardEl(c) {
@@ -250,16 +295,79 @@
 						${c.lastResult ? `<span class="tag ${c.lastResult === 'DONE' ? '' : 'err'}">${esc(c.lastResult)}</span>` : ''}
 					</div>`;
 				el.addEventListener('dragstart', () => { dragId = c.id; });
-				el.addEventListener('click', () => { selectedId = c.id; editing = false; renderPanel(); });
+				el.addEventListener('click', () => {
+				if (isDirty() && !confirm('Discard the unsaved changes on this card?')) return;
+				selectedId = c.id;
+				baseline = null;
+				lastSaveMsg = null;
+				renderPanel();
+			});
 				return el;
 			}
+
+			/**
+			 * Which sections the user has opened, kept across re-renders so a poll never
+			 * folds a section shut while it is being read.
+			 */
+			const openGroups = {};
+
+			/** The values the panel was rendered with, to compare against for unsaved edits. */
+			let baseline = null;
+
+			/** The editable fields, in one list, so save/revert/dirty all agree on the set. */
+			const FIELDS = [
+				['f-title', 'title'],
+				['f-desc', 'description'],
+				['f-ac', 'acceptanceCriteria'],
+				['f-prio', 'priority'],
+				['f-order', 'order'],
+				['f-max', 'maxAttempts'],
+				['f-repo', 'repo'],
+				['f-agent', 'agent'],
+				['f-deps', 'dependencies'],
+				['f-hold', 'hold'],
+				['f-every', 'every'],
+			];
+
+			/** What the form currently holds, as plain strings for a cheap comparison. */
+			function formValues() {
+				const out = {};
+				for (const [id] of FIELDS) out[id] = document.getElementById(id)?.value ?? '';
+				return out;
+			}
+
+			const isDirty = () => {
+				if (!baseline) return false;
+				const now = formValues();
+				return FIELDS.some(([id]) => now[id] !== baseline[id]);
+			};
+
+			/**
+			 * The footer is the only place that talks about saving, and it always describes
+			 * the current state: nothing to save, unsaved edits, in flight, or the result.
+			 * `message` survives a re-render so a "Saved" confirmation is actually readable.
+			 */
+			function renderFooter(message = null, tone = '') {
+				const dirty = isDirty();
+				const btn = document.getElementById('saveBtn');
+				const revert = document.getElementById('revertBtn');
+				const msg = document.getElementById('saveMsg');
+				btn.disabled = !dirty || saving;
+				btn.textContent = saving ? 'Saving…' : 'Save changes';
+				revert.disabled = !dirty || saving;
+				revert.title = dirty ? '' : 'Nothing has been changed';
+				msg.className = `msg ${tone}`;
+				msg.textContent = message ?? (dirty ? 'Unsaved changes' : '');
+			}
+
+			let saving = false;
+			let lastSaveMsg = null;
 
 			async function renderPanel() {
 				const c = snapshot.cards.find((x) => x.id === selectedId);
 				if (!c) return closePanel();
 				const inFlightIds = ((snapshot.scheduler || {}).inFlight || []).map((f) => f.cardId);
-				const panel = document.getElementById('panel');
-				panel.classList.remove('hidden');
+				document.getElementById('panel').classList.remove('hidden');
 				let runs = [];
 				let comments = [];
 
@@ -276,166 +384,231 @@
 					retry: !running && (c.state === 'Blocked' || c.attemptCount > 0),
 					destroy: !running,
 					verdict: reviewable,
-					hold: !running,
 					openChanges: Boolean(c.worktreePath),
 					openSession: running && Boolean(c.sessionId),
-					clearHold: Boolean(c.notBefore),
 				};
 				const why = {
 					retry: running ? 'Stop the card first' : 'Nothing has been attempted yet',
 					destroy: 'Stop the card before deleting it',
-					verdict: `A card in ${c.state} has no result to judge — only Review or Blocked`,
-					hold: 'Stop the card first',
+					verdict: `Only a card in Review or Blocked has a result to judge — this one is in ${c.state}`,
 					openChanges: 'This card has never run, so there are no changes',
 					openSession: c.sessionId ? 'The session is closed; open the changes instead' : 'This card has no session',
-					clearHold: 'This card is not on hold',
 				};
 				try { runs = (await api(`/api/cards/${encodeURIComponent(c.id)}/runs`)).runs; } catch {}
 				try { comments = (await api(`/api/cards/${encodeURIComponent(c.id)}/comments`)).comments; } catch {}
 
+				// Open what this card's state is actually about, unless the user chose.
+				const open = (name, fallback) => (openGroups[name] ?? fallback) ? 'open' : '';
+				const held = c.notBefore && c.notBefore > Date.now();
+
+				document.getElementById('panelHead').innerHTML = `
+					<h2>${esc(c.title)}</h2>
+					<div class="meta">
+						<span class="tag">${esc(c.state)}</span>
+						<span class="tag p">P${c.priority}</span>
+						${c.attemptCount ? `<span class="tag">try ${c.attemptCount}/${c.maxAttempts}</span>` : ''}
+						${!eligibleNow(c) && c.heldBecause ? `<span class="tag" style="color:var(--warn)">${esc(c.heldBecause)}</span>` : ''}
+						<span class="tag">${esc(c.id)}</span>
+					</div>`;
+
 				document.getElementById('panelBody').innerHTML = `
-					<h2 style="font-size:13px;margin:0 0 2px">${esc(c.title)}</h2>
-					<div class="meta"><span class="tag">${esc(c.id)}</span><span class="tag">${esc(c.state)}</span></div>
+					<details class="group" data-g="work" ${open('work', true)}>
+						<summary>The work</summary>
+						<div class="group-body">
+							<label for="f-title">Title</label>
+							<input id="f-title" value="${esc(c.title)}" />
+							<label for="f-desc">Description</label>
+							<textarea id="f-desc">${esc(c.description)}</textarea>
+							<label for="f-ac">Acceptance criteria</label>
+							<textarea id="f-ac">${esc(c.acceptanceCriteria)}</textarea>
+						</div>
+					</details>
 
-					<label>Title</label><input id="f-title" value="${esc(c.title)}" />
-					<label>Description</label><textarea id="f-desc">${esc(c.description)}</textarea>
-					<label>Acceptance criteria</label><textarea id="f-ac">${esc(c.acceptanceCriteria)}</textarea>
-					<div class="row">
-						<div><label>Priority</label><input id="f-prio" type="number" value="${c.priority}" /></div>
-						<div><label>Order</label><input id="f-order" type="number" value="${c.order}" /></div>
-						<div><label>Max attempts</label><input id="f-max" type="number" min="1" value="${c.maxAttempts}" /></div>
-					</div>
-					<div class="row">
-						<div><label>Repo (path or id:…)</label><input id="f-repo" value="${esc(c.repo ?? '')}" /></div>
-						<div><label>Agent</label><select id="f-agent">
-							<option value="">default (${esc(snapshot.config.defaultAgent)})</option>
-							${(snapshot.config.agents || []).map((a) => `<option ${c.agent === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}
-						</select></div>
-					</div>
-					<label>Dependencies (comma-separated card ids)</label>
-					<input id="f-deps" value="${esc(c.dependencies.join(','))}" />
-
-					<div class="row" style="margin-top:12px">
-						<button class="primary" onclick="saveCard()">Save</button>
-						<button ${can.retry ? '' : `disabled title="${esc(why.retry)}"`} onclick="retryCard()">Retry</button>
-						<button class="danger" ${can.destroy ? '' : `disabled title="${esc(why.destroy)}"`} onclick="deleteCard()">Delete</button>
-					</div>
-
-					<div class="review">
-						<label>Schedule</label>
-						<div class="row">
-							<div>
-								<label>Hold until</label>
-								<input id="f-snooze" placeholder="7d, 12h or 2026-08-19" />
+					<details class="group" data-g="run" ${open('run', false)}>
+						<summary>How it runs<span class="n">${esc(c.agent || snapshot.config.defaultAgent)}${c.dependencies.length ? ` · ${c.dependencies.length} dep${c.dependencies.length > 1 ? 's' : ''}` : ''}</span></summary>
+						<div class="group-body">
+							<div class="grid">
+								<div><label for="f-prio">Priority</label><input id="f-prio" type="number" value="${c.priority}" /></div>
+								<div><label for="f-order">Order</label><input id="f-order" type="number" value="${c.order}" /></div>
+								<div><label for="f-max">Max tries</label><input id="f-max" type="number" min="1" value="${c.maxAttempts}" /></div>
 							</div>
-							<div>
-								<label>Repeat every</label>
-								<input id="f-every" placeholder="1w, 3d, 12h" value="${c.repeatEveryMs ? Math.round(c.repeatEveryMs / 3600000) + 'h' : ''}" />
+							<label for="f-repo">Repo — path or <kbd>id:…</kbd></label>
+							<input id="f-repo" value="${esc(c.repo ?? '')}" placeholder="${esc(snapshot.config.defaultRepo || 'default repo')}" />
+							<label for="f-agent">Agent</label>
+							<select id="f-agent">
+								<option value="">default (${esc(snapshot.config.defaultAgent)})</option>
+								${(snapshot.config.agents || []).map((a) => `<option ${c.agent === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}
+							</select>
+							<label for="f-deps">Waits for — card ids, comma separated</label>
+							<input id="f-deps" value="${esc(c.dependencies.join(','))}" placeholder="card_a, card_b" />
+							<div class="grid">
+								<div>
+									<label for="f-hold">Hold until</label>
+									<input id="f-hold" value="${held ? esc(new Date(c.notBefore).toISOString().slice(0, 10)) : ''}" placeholder="7d, 12h, 2026-08-19" />
+								</div>
+								<div>
+									<label for="f-every">Repeat every</label>
+									<input id="f-every" value="${c.repeatEveryMs ? esc(humanDuration(c.repeatEveryMs)) : ''}" placeholder="1w, 3d, 12h" />
+								</div>
 							</div>
+							${held ? `<div class="hint">Held until ${new Date(c.notBefore).toLocaleString()} — ${rel(c.notBefore)}. Clear the field and save to release it.</div>` : ''}
+							<div class="actions">
+								<button ${can.retry ? '' : `disabled title="${esc(why.retry)}"`} onclick="retryCard()">Retry now</button>
+								${stoppable ? '<button class="danger" onclick="stopThisCard()">Stop this card</button>' : ''}
+								<button class="danger" ${can.destroy ? '' : `disabled title="${esc(why.destroy)}"`} onclick="deleteCard()">Delete</button>
+							</div>
+							${running && !stoppable ? '<div class="hint">Running under another scheduler, so it cannot be stopped from here.</div>' : ''}
 						</div>
-						<div class="row" style="margin-top:6px">
-							<button ${can.hold ? '' : `disabled title="${esc(why.hold)}"`} onclick="snoozeCard()">Hold</button>
-							<button onclick="saveRepeat()">Save repeat</button>
-							<button ${can.clearHold ? '' : `disabled title="${esc(why.clearHold)}"`} onclick="clearSchedule()">Clear</button>
+					</details>
+
+					<details class="group" data-g="review" ${open('review', reviewable)}>
+						<summary>Review<span class="n">${reviewable ? 'your call' : esc(c.lastResult || 'not run')}</span></summary>
+						<div class="group-body">
+							${c.lastAgentSummary ? `<label>What the agent said</label><pre style="color:var(--text)">${esc(c.lastAgentSummary)}</pre>` : ''}
+							${c.lastError ? `<label>Last error</label><pre style="color:var(--bad)">${esc(c.lastError)}</pre>` : ''}
+							<div class="actions" style="margin-top:0">
+								<button ${can.openChanges ? '' : `disabled title="${esc(why.openChanges)}"`} onclick="openInOrca('changes')">Open in Orca</button>
+								<button ${can.openSession ? '' : `disabled title="${esc(why.openSession)}"`} onclick="openInOrca('session')">Open session</button>
+								${can.openChanges ? `<button onclick="loadDiff()">${diffCache.cardId === c.id ? 'Reload' : 'Show'} diff</button>` : ''}
+							</div>
+							${diffCache.cardId === c.id ? `<pre style="max-height:300px;color:var(--text)">${esc(diffCache.text)}</pre>` : ''}
+							${c.commitSha ? `<div class="hint">Committed as <code>${esc(c.commitSha.slice(0, 8))}</code>.</div>` : can.openChanges ? '<div class="hint warn">Not committed — approving commits it on this card\u2019s branch.</div>' : ''}
+							${can.verdict ? `
+								<label for="f-comment">Your verdict</label>
+								<textarea id="f-comment" placeholder="Required to request changes — the next agent reads it"></textarea>
+								<div class="actions" style="margin-top:6px">
+									<button class="ok" onclick="approveCard()">Approve → Done</button>
+									<button class="danger" onclick="rejectCard()">Request changes → Ready</button>
+									<button onclick="addComment()">Note only</button>
+								</div>` : `
+								<div class="hint">${esc(why.verdict)}.</div>
+								<div class="actions" style="margin-top:6px">
+									<label for="f-comment" style="margin:0">Add a note</label>
+								</div>
+								<textarea id="f-comment" placeholder="Anything worth recording on this card"></textarea>
+								<div class="actions" style="margin-top:6px"><button onclick="addComment()">Add note</button></div>`}
+							<details class="group" data-g="trail" ${open('trail', false)} style="border:0">
+								<summary>Review trail<span class="n">${comments.length}</span></summary>
+								<div class="trail">${
+									comments.map((m) => `<div><span class="k ${esc(m.kind)}">${esc(m.kind === 'comment' ? 'note' : m.kind)}</span> · ${esc(m.author)} · ${new Date(m.createdAt).toLocaleString()}<br>${esc(m.body)}</div>`).join('') || '<div class="hint">Nothing recorded yet.</div>'
+								}</div>
+							</details>
 						</div>
-						${c.notBefore ? `<div class="hint">Held until ${new Date(c.notBefore).toLocaleString()} (${rel(c.notBefore)}).</div>` : ''}
-						${stoppable ? '<button class="danger" style="margin-top:8px" onclick="stopThisCard()">Stop this card now</button>' : running ? '<div class="hint">Running under another scheduler, so it cannot be stopped from here.</div>' : ''}
-					</div>
+					</details>
 
-					<div class="review">
-						<label>Review — what the agent produced</label>
-						<div class="row">
-							<button ${can.openChanges ? '' : `disabled title="${esc(why.openChanges)}"`} onclick="openInOrca('changes')">Open changes in Orca</button>
-							<button ${can.openSession ? '' : `disabled title="${esc(why.openSession)}"`} onclick="openInOrca('session')">Open session</button>
+					<details class="group" data-g="tech" ${open('tech', false)}>
+						<summary>Runs and technical<span class="n">${runs.length} run${runs.length === 1 ? '' : 's'}</span></summary>
+						<div class="group-body">
+							<div class="runs">${
+								runs.map((r) => `<div><b>${esc(r.status)}</b> · ${new Date(r.startedAt).toLocaleString()}${r.commitSha ? ' · ' + esc(r.commitSha.slice(0, 8)) : ''}${r.error ? `<br><span style="color:var(--bad)">${esc(r.error)}</span>` : ''}</div>`).join('') || '<div class="hint">Never run.</div>'
+							}</div>
+							${c.worktreePath ? `<label>Worktree</label><pre>${esc(c.worktreePath)}${c.branch ? `\n${esc(c.branch)}` : ''}${c.worktreeId ? `\n${esc(c.worktreeId)}` : ''}</pre>` : ''}
+							${c.sessionId ? `<label>Orca session</label><pre>${esc(c.sessionId)}</pre>` : ''}
+							${c.commitSha ? `<label>Commit</label><pre>${esc(c.commitSha)}</pre>` : ''}
 						</div>
-						${can.openChanges ? `<button style="margin-top:6px" onclick="loadDiff()">${diffCache.cardId === c.id ? 'Reload' : 'Show'} changes here</button>` : '<div class="hint">No worktree yet — this card has not run.</div>'}
-						${diffCache.cardId === c.id ? `<pre style="max-height:320px;color:var(--text)">${esc(diffCache.text)}</pre>` : ''}
-						${c.commitSha ? `<div class="hint">Work committed as <code>${esc(c.commitSha.slice(0, 8))}</code>.</div>` : can.openChanges ? '<div class="hint" style="color:var(--warn)">Not committed yet — approving will commit it on this card\u2019s branch.</div>' : ''}
+					</details>`;
 
-						<label>Comment / reason</label>
-						<textarea id="f-comment" placeholder="What must change, or why this is good"></textarea>
-						<div class="row">
-							<button class="ok" ${can.verdict ? '' : `disabled title="${esc(why.verdict)}"`} onclick="approveCard()">Approve → Done</button>
-							<button class="danger" ${can.verdict ? '' : `disabled title="${esc(why.verdict)}"`} onclick="rejectCard()">Request changes → Ready</button>
-						</div>
-						<button style="margin-top:6px" onclick="addComment()">Comment only</button>
-						<div class="hint">Approving commits the work on this card's branch, then moves it to Done. A rejection reason is sent to the next agent that picks the card up.</div>
-
-						<label>Review trail (${comments.length})</label>
-						<div class="trail">${
-							comments.map((m) => `<div><span class="k ${esc(m.kind)}">${esc(m.kind === 'comment' ? 'note' : m.kind)}</span> · ${esc(m.author)} · ${new Date(m.createdAt).toLocaleString()}<br>${esc(m.body)}</div>`).join('') || '<div class="hint">no comments yet</div>'
-						}</div>
-					</div>
-
-					${c.worktreePath ? `<label>Worktree</label><pre>${esc(c.worktreePath)}\n${esc(c.branch ?? '')}\n${esc(c.worktreeId ?? '')}</pre>` : ''}
-					${c.sessionId ? `<label>Orca session</label><pre>${esc(c.sessionId)}</pre>` : ''}
-					${c.commitSha ? `<label>Commit</label><pre>${esc(c.commitSha)}</pre>` : ''}
-					${c.lastAgentSummary ? `<label>Agent summary</label><pre>${esc(c.lastAgentSummary)}</pre>` : ''}
-					${c.lastError ? `<label>Last error</label><pre style="color:var(--bad)">${esc(c.lastError)}</pre>` : ''}
-
-					<label>Run history (${runs.length})</label>
-					<div class="runs">${
-						runs.map((r) => `<div><b>${esc(r.status)}</b> · ${new Date(r.startedAt).toLocaleString()}${r.commitSha ? ' · ' + esc(r.commitSha.slice(0, 8)) : ''}${r.error ? `<br><span style="color:var(--bad)">${esc(r.error)}</span>` : ''}</div>`).join('') || '<div class="hint">no runs yet</div>'
-					}</div>`;
-
-				for (const el of document.querySelectorAll('#panelBody input, #panelBody textarea, #panelBody select')) {
-					el.addEventListener('focus', () => { editing = true; });
-					el.addEventListener('blur', () => { editing = false; });
+				// Remember only what the USER opened. Chrome queues a `toggle` event for a
+				// details that is inserted already open, so listening to `toggle` made the
+				// auto-opened Review section leak onto every card clicked afterwards.
+				for (const d of document.querySelectorAll('#panelBody details.group')) {
+					d.querySelector('summary').addEventListener('click', () => { openGroups[d.dataset.g] = !d.open; });
 				}
+				// Every edit re-evaluates the footer, so "Unsaved changes" appears as you type.
+				for (const el of document.querySelectorAll('#panelBody input, #panelBody textarea, #panelBody select')) {
+					el.addEventListener('input', () => renderFooter());
+					el.addEventListener('change', () => renderFooter());
+				}
+
+				baseline = formValues();
+				renderFooter(lastSaveMsg?.text, lastSaveMsg?.tone);
+			}
+
+			const eligibleNow = (c) => (snapshot.eligible || []).includes(c.id);
+
+			/** Milliseconds back into the shortest thing a person would have typed. */
+			function humanDuration(ms) {
+				for (const [unit, size] of [['w', 604800000], ['d', 86400000], ['h', 3600000], ['m', 60000]]) {
+					if (ms % size === 0) return `${ms / size}${unit}`;
+				}
+				return `${Math.round(ms / 3600000)}h`;
 			}
 
 			function closePanel() {
+				if (isDirty() && !confirm('Discard the unsaved changes on this card?')) return;
 				selectedId = null;
-				editing = false;
+				baseline = null;
+				lastSaveMsg = null;
 				document.getElementById('panel').classList.add('hidden');
 			}
 
 			const val = (id) => document.getElementById(id).value;
 
+			/** Puts a result in the footer and lets it fade on the next real interaction. */
+			function reportSave(text, tone) {
+				lastSaveMsg = { text, tone };
+				renderFooter(text, tone);
+				if (tone === 'ok') setTimeout(() => { if (lastSaveMsg?.text === text) { lastSaveMsg = null; renderFooter(); } }, 4000);
+			}
+
+			/**
+			 * One save for the whole card, including the schedule. Two endpoints are still
+			 * involved because a hold is expressed as a duration the server parses, but the
+			 * user sees a single button and a single outcome.
+			 */
 			async function saveCard() {
-				await api(`/api/cards/${encodeURIComponent(selectedId)}`, 'PATCH', {
-					title: val('f-title'),
-					description: val('f-desc'),
-					acceptanceCriteria: val('f-ac'),
-					priority: Number(val('f-prio')),
-					order: Number(val('f-order')),
-					maxAttempts: Number(val('f-max')),
-					repo: val('f-repo') || null,
-					agent: val('f-agent') || null,
-					dependencies: val('f-deps').split(',').map((s) => s.trim()).filter(Boolean),
-				});
-				editing = false;
+				if (!isDirty() || saving) return;
+				const hold = val('f-hold').trim();
+				const every = val('f-every').trim();
+				const everyMs = every ? durationMs(every) : null;
+				if (every && everyMs === null) return reportSave('Could not read the repeat interval — try 1w, 3d or 12h.', 'bad');
+
+				saving = true;
+				renderFooter('Saving…');
+				try {
+					const patch = {
+						title: val('f-title'),
+						description: val('f-desc'),
+						acceptanceCriteria: val('f-ac'),
+						priority: Number(val('f-prio')),
+						order: Number(val('f-order')),
+						maxAttempts: Number(val('f-max')),
+						repo: val('f-repo') || null,
+						agent: val('f-agent') || null,
+						dependencies: val('f-deps').split(',').map((s) => s.trim()).filter(Boolean),
+						repeatEveryMs: everyMs,
+					};
+					// An emptied hold field means release it; the snooze route owns setting one
+					// because it is what understands "7d".
+					if (hold === '') patch.notBefore = null;
+					await api(`/api/cards/${encodeURIComponent(selectedId)}`, 'PATCH', patch);
+					if (hold !== '' && hold !== baseline['f-hold']) {
+						await api(`/api/cards/${encodeURIComponent(selectedId)}/snooze`, 'POST', { until: hold });
+					}
+				} catch (e) {
+					saving = false;
+					return reportSave(e.message, 'bad');
+				}
+				saving = false;
+				// Drop the baseline first: the poll refuses to redraw while the form looks
+				// dirty, so without this the panel keeps saying "Unsaved changes" and the
+				// header keeps showing the values you just replaced.
+				baseline = null;
+				lastSaveMsg = { text: 'Saved', tone: 'ok' };
 				await refresh();
+				reportSave('Saved', 'ok');
+			}
+
+			/** Throws the edits away and shows the card as the board has it. */
+			function revertCard() {
+				if (!isDirty()) return;
+				lastSaveMsg = null;
+				baseline = null;
+				renderPanel();
 			}
 
 			async function retryCard() {
 				await api(`/api/cards/${encodeURIComponent(selectedId)}/retry`, 'POST', {});
-				await refresh();
-			}
-
-			async function snoozeCard() {
-				const until = (document.getElementById('f-snooze').value || '').trim();
-				if (!until) return alert('Say when: 7d, 12h, or a date like 2026-08-19.');
-				try {
-					await api(`/api/cards/${encodeURIComponent(selectedId)}/snooze`, 'POST', { until });
-				} catch (e) {
-					return alert(e.message);
-				}
-				editing = false;
-				await refresh();
-			}
-
-			async function saveRepeat() {
-				const every = (document.getElementById('f-every').value || '').trim();
-				const ms = every ? durationMs(every) : null;
-				if (every && ms === null) return alert('Could not read that interval. Try 1w, 3d or 12h.');
-				await api(`/api/cards/${encodeURIComponent(selectedId)}`, 'PATCH', { repeatEveryMs: ms });
-				editing = false;
-				await refresh();
-			}
-
-			async function clearSchedule() {
-				await api(`/api/cards/${encodeURIComponent(selectedId)}`, 'PATCH', { notBefore: null });
 				await refresh();
 			}
 
@@ -457,27 +630,39 @@
 
 			const commentText = () => (document.getElementById('f-comment')?.value ?? '').trim();
 
+			/**
+			 * Every verdict reports through the footer, the same place a save does, so there
+			 * is one spot to look for "did that work" instead of a mix of alerts and silence.
+			 */
+			async function postVerdict(action, body, done) {
+				renderFooter('Working…');
+				try {
+					await api(`/api/cards/${encodeURIComponent(selectedId)}/${action}`, 'POST', body);
+				} catch (e) {
+					return reportSave(e.message, 'bad');
+				}
+				// The verdict moved the card, so the panel must redraw from the board.
+				baseline = null;
+				lastSaveMsg = { text: done, tone: 'ok' };
+				await refresh();
+				reportSave(done, 'ok');
+			}
+
 			async function approveCard() {
 				const body = commentText();
-				await api(`/api/cards/${encodeURIComponent(selectedId)}/approve`, 'POST', body ? { comment: body } : {});
-				editing = false;
-				await refresh();
+				await postVerdict('approve', body ? { comment: body } : {}, 'Approved and committed');
 			}
 
 			async function rejectCard() {
 				const body = commentText();
-				if (!body) return alert('Say what needs to change — the next agent reads this.');
-				await api(`/api/cards/${encodeURIComponent(selectedId)}/reject`, 'POST', { comment: body });
-				editing = false;
-				await refresh();
+				if (!body) return reportSave('Say what needs to change — the next agent reads this.', 'bad');
+				await postVerdict('reject', { comment: body }, 'Sent back to Ready');
 			}
 
 			async function addComment() {
 				const body = commentText();
-				if (!body) return alert('Nothing to say yet.');
-				await api(`/api/cards/${encodeURIComponent(selectedId)}/comments`, 'POST', { body });
-				editing = false;
-				await refresh();
+				if (!body) return reportSave('Write the note first.', 'bad');
+				await postVerdict('comments', { body }, 'Note added');
 			}
 
 			async function loadDiff() {
@@ -548,6 +733,15 @@
 					document.getElementById('sstate').innerHTML = `<span class="dot" style="background:var(--bad)"></span>${esc(e.message)}`;
 				}
 			}
+
+			// Two habits people already have: Esc closes, and the browser warns before a
+			// reload throws work away.
+			document.addEventListener('keydown', (e) => {
+				if (e.key === 'Escape' && selectedId) closePanel();
+			});
+			window.addEventListener('beforeunload', (e) => {
+				if (isDirty()) e.preventDefault();
+			});
 
 			refresh();
 			setInterval(refresh, 1500);
