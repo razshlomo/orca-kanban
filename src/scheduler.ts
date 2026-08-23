@@ -129,6 +129,14 @@ export class Scheduler extends EventEmitter {
 	}
 
 	/**
+	 * Re-evaluates the board now instead of at the next poll. Used after a config change
+	 * so a raised `maxConcurrent` or a cleared hold is acted on immediately.
+	 */
+	nudge(): void {
+		this.wakeUp();
+	}
+
+	/**
 	 * Aborts an in-flight card immediately (its Orca session is interrupted).
 	 * Without a card id, aborts every card this scheduler is running.
 	 */

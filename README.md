@@ -82,7 +82,8 @@ kanban doctor
 `install.sh` is idempotent. It writes a `kanban` wrapper to `~/bin` (or `~/.local/bin`),
 copies the skill to `~/.claude/skills/orca-kanban/` — which **omp and Claude Code both
 read** — and appends a pointer block to `~/.codex/AGENTS.md` and `~/AGENTS.md` for codex
-and cursor.
+and cursor. Pass `--service` to also install the background service (see
+[Settings and the background service](#settings-and-the-background-service)).
 
 ### Agent integration
 
@@ -136,11 +137,16 @@ Create `~/.orca-kanban/config.json` (JSON, matching the documented shape 1:1):
 
 A nested `{ "kanban": { … }, "agents": { … } }` layout is also accepted.
 
+Every field above is also editable from the UI (**Settings**) or the API, so config.json
+is a starting point rather than the only way in — see
+[Settings and the background service](#settings-and-the-background-service).
+
 Then start the board and scheduler:
 
 ```bash
 kanban serve                # http://localhost:7420
 kanban serve --auto-run     # …and start picking up cards immediately
+kanban service install      # …or run it in the background, from login onwards
 ```
 
 ### Configuring OMP (and other agents)
@@ -729,6 +735,99 @@ columns for.
 
 ---
 
+## Settings and the background service
+
+The board can configure itself and run itself. **Settings** in the header opens one
+panel with both halves: the service manager on top, every editable `config.json` field
+below.
+
+```bash
+kanban service install                 # run it in the background from now on
+kanban service install --no-autostart  # install it, but start it by hand
+kanban service status                  # manager, unit path, pid, log
+kanban service restart | stop | start
+kanban service autostart off           # keep the unit, stop starting it at login
+kanban service uninstall
+```
+
+### It is a per-user agent, not a system daemon
+
+On macOS this is a **LaunchAgent** in `~/Library/LaunchAgents/co.orca.kanban.plist`,
+bootstrapped into `gui/<uid>`; on Linux a systemd **user** unit in
+`~/.config/systemd/user/`. Not a LaunchDaemon, and not a system unit — the scheduler
+drives Orca through its CLI, and Orca is a desktop app living in your login session. A
+system-context daemon cannot reach it, so every `worktree create` would fail.
+
+Two consequences worth knowing:
+
+- **PATH is captured at install time.** launchd starts jobs with a bare `PATH` and no
+  shell profile, so the unit carries the `PATH` of the shell that installed it. Install
+  from a normal terminal, or the service will not find `orca`, `omp`, `claude`.
+- **The interpreter is pinned to a stable path.** `process.execPath` resolves to a
+  version-pinned real path (`…/Cellar/node/26.6.0/bin/node`), which the next upgrade
+  deletes. If `PATH` holds a symlink to the same binary (`/opt/homebrew/bin/node`), that
+  is what gets written into the unit instead.
+
+### "Always on" is one switch, deliberately
+
+launchd starts a `KeepAlive` job at load whether `RunAtLoad` is set or not, so "restart
+forever but do not start at login" is not a state the manager can hold. One checkbox:
+
+| Always on | Effect |
+| --- | --- |
+| on | starts at login, comes back after a crash |
+| off | installed and idle; `kanban service start` runs it, a crash leaves it down |
+
+This is separate from `autoRun`. The service decides whether the **board** is up;
+`autoRun` decides whether **cards** are picked up. Keeping them apart is deliberate:
+otherwise logging in would silently start agents.
+
+### Only one scheduler, ever
+
+A second scheduler is refused rather than tolerated. The port already stopped a second
+`serve`, but nothing stopped `kanban run` beside it, and two loops on one board both
+drive the same agent sessions — both settling the same card, both closing the same
+terminal. The board's claim transaction caps concurrent *cards*, not concurrent
+*watchers*:
+
+```
+$ kanban run --once
+Refusing to run "run": another scheduler is already watching this board (pid 40413).
+…
+  stop it:  kanban service stop
+```
+
+`serve`, `run`, `run --once` and `recover` all check first, and exit `5`. The check is
+the same pid + heartbeat liveness test `kanban status` uses, so a crashed owner never
+blocks a restart — which is what makes an always-on service safe to kill and respawn.
+
+### Settings that need a restart, and ones that do not
+
+Nearly everything applies in place: the executor asks for `config.cardTimeoutMs` per
+card, the loop for `config.maxConcurrent` per pass, so writing the value is the whole of
+applying it. Two are captured once at boot and say so instead of pretending — `port`
+(bound) and `orchestration.enabled` (client constructed). The panel tags them
+**needs restart**, then **pending restart** once saved, and the board itself carries the
+pending list until it restarts.
+
+**Restart board** exits and lets the manager start the replacement, then the panel polls
+until the new process answers. It refuses while a card is running rather than
+interrupting an agent's turn — unless you confirm.
+
+### A broken config cannot lock you out
+
+`serve` no longer dies on an unusable `config.json`; it starts on defaults, says so in
+the header and in Settings, and lets you write a clean file from the UI. The alternative
+under a service manager is a 10-second crash loop with no UI to fix it from. The
+unreadable original is moved to `config.json.broken` rather than overwritten.
+
+Patches are validated as a whole candidate *before* anything is written, and written by
+rename — so a rejected setting changes neither the file nor the running board, and no
+reader ever sees a half-written config. `enabled: false` keeps the board up with pickup
+paused, for the same reason: the switch that turns it back on lives in that UI.
+
+---
+
 ## HTTP API
 
 | Method | Route | Purpose |
@@ -750,6 +849,10 @@ columns for.
 | POST | `/api/cards/:id/snooze` | `{ "until": "7d" }` — hold the card until due |
 | POST | `/api/cards/reorder` | `{ "ids": [...] }` |
 | POST | `/api/scheduler/{start,pause,autorun,stop-after-current,stop-current,run-once,recover}` | controls; `stop-current` takes an optional `{ "cardId": … }` |
+| GET | `/api/config` | every editable setting, its value, and whether it needs a restart |
+| PATCH | `/api/config` | `{ "maxConcurrent": 2 }` — validated, then written to config.json |
+| GET | `/api/service` | service manager state: installed, running, pid, always-on |
+| POST | `/api/service/{install,uninstall,start,stop,restart,autostart}` | manage the background service |
 
 ---
 
@@ -776,19 +879,23 @@ Prompt/result handshake files live in `<worktree>/.orca-kanban/` (added to
 
 ## Logging
 
-JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `cardId`,
-`sessionId`, and `runId` where known:
+JSON lines to `~/.orca-kanban/scheduler.log`, and to stderr unless a service manager is
+running the board (in which case stderr is already redirected into the same log). Every
+line carries `cardId`, `sessionId`, and `runId` where known:
 
 `card_selected` · `card_claimed` · `session_started` · `agent_started` · `agent_idle` ·
 `card_completed` · `card_blocked` · `card_failed` · `retry_scheduled` · `scheduler_idle` ·
 `card_recovered` · `session_closed`
+
+The log rotates at 8 MB, keeping one previous file — a board that runs for months as a
+service would otherwise grow without limit.
 
 ---
 
 ## Tests
 
 ```bash
-npm test          # 221 tests
+npm test          # 248 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```

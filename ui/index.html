@@ -158,6 +158,23 @@
 				background: var(--panel-2); border: 1px solid var(--border); border-radius: 3px;
 				padding: 0 4px; font: inherit; font-size: 10px;
 			}
+			/* Settings reuses the card panel's shape: same fixed strip, one scrolling body,
+			   one action bar. Two panels, one layout, so nothing new to learn. */
+			.field { margin-bottom: 2px; }
+			.field .k { color: var(--muted); font-size: 10px; font-family: ui-monospace, SFMono-Regular, monospace; }
+			.field.restart label { color: var(--warn); }
+			.cb { display: flex; align-items: center; gap: 7px; margin: 9px 0 3px; }
+			.cb input { width: auto; }
+			.cb span { font-size: 12px; }
+			.banner {
+				margin: 10px 0 0; padding: 8px 10px; border-radius: 6px; font-size: 11px;
+				border: 1px solid var(--border); background: #0d1117;
+			}
+			.banner.bad { border-color: #5b2422; color: var(--bad); }
+			.banner.warn { border-color: #493c1a; color: var(--warn); }
+			#cfgwarn { font-size: 11px; }
+			#cfgwarn.bad { color: var(--bad); }
+			#cfgwarn.warn { color: var(--warn); }
 		</style>
 	</head>
 	<body>
@@ -169,10 +186,12 @@
 			<button id="once">Run one card</button>
 			<button id="recover">Recover</button>
 			<button id="new">+ Card</button>
+			<button id="settings">Settings</button>
 			<div class="status">
 				<span id="sstate"><span class="dot"></span>—</span>
 				<span id="scur"></span>
 				<span id="scount"></span>
+				<span id="cfgwarn"></span>
 			</div>
 		</header>
 
@@ -186,6 +205,17 @@
 				<button class="primary" id="saveBtn" onclick="saveCard()">Save changes</button>
 				<button id="revertBtn" onclick="revertCard()">Revert</button>
 				<span class="msg" id="saveMsg"></span>
+			</div>
+		</aside>
+
+		<aside id="setpanel" class="hidden">
+			<button class="close" onclick="closeSettings()" title="Close (Esc)">close</button>
+			<div class="p-head"><h2>Settings</h2><div class="meta" id="setPath"></div></div>
+			<div class="p-body" id="setBody"></div>
+			<div class="p-foot">
+				<button class="primary" id="setSave" onclick="saveSettings()">Save settings</button>
+				<button id="setRestart" onclick="restartService()">Restart board</button>
+				<span class="msg" id="setMsg"></span>
 			</div>
 		</aside>
 		<script>
@@ -299,6 +329,15 @@
 				document.getElementById('scount').innerHTML =
 					`${s.cardsExecuted ?? 0} executed · ${s.inFlightCount ?? 0}/${s.maxConcurrent ?? 1} slots` +
 					(held.length ? ` · <span style="color:var(--mine)" title="${esc(held.map((c) => c.id).join(', '))}">${held.length} yours</span>` : '');
+
+				// A board running on defaults because config.json is broken, or running with a
+				// saved setting it has not picked up yet, must say so where you already look.
+				const cfgWarn = document.getElementById('cfgwarn');
+				const cfgError = (snapshot.config || {}).error;
+				const disabled = (snapshot.config || {}).enabled === false;
+				cfgWarn.className = cfgError ? 'bad' : disabled ? 'warn' : '';
+				cfgWarn.textContent = cfgError ? '· config ignored' : disabled ? '· board disabled' : '';
+				cfgWarn.title = cfgError ? `${cfgError} — open Settings to fix it` : disabled ? 'enabled is false: nothing is picked up' : '';
 
 				// Every lane, not just the first, so a multi-slot board is legible.
 				const lanes = s.inFlight || [];
@@ -493,6 +532,8 @@
 				const c = snapshot.cards.find((x) => x.id === selectedId);
 				if (!c) return closePanel();
 				const inFlightIds = ((snapshot.scheduler || {}).inFlight || []).map((f) => f.cardId);
+				// Both panels are the same fixed slot on the right, so one of them owns it.
+				closeSettings();
 				document.getElementById('panel').classList.remove('hidden');
 				let runs = [];
 				let comments = [];
@@ -1098,6 +1139,215 @@
 			ctl('once', '/api/scheduler/run-once');
 			ctl('recover', '/api/scheduler/recover');
 
+			// ------------------------------------------------------------------ settings
+			// Two things live here: the board's own config.json, and whether the board runs
+			// as a background service at all. They belong together — "always running" is
+			// half a service manager setting and half an auto-run setting, and getting one
+			// without the other is the confusing state this panel exists to prevent.
+			let settings = null;
+			let service = null;
+
+			const fieldId = (key) => `cfg_${key.replace(/\./g, '__')}`;
+
+			function settingsBody() {
+				const svc = service || {};
+				const cfg = settings || { fields: [] };
+				const pending = cfg.restartPending || [];
+
+				const svcLine = !svc.supported
+					? `<div class="banner bad">${esc(svc.detail || 'no service manager here')}</div>`
+					: !svc.installed
+						? `<div class="banner warn">Not installed. The board only runs while a terminal keeps it running.</div>`
+						: `<div class="banner${svc.running ? '' : ' warn'}">${esc(svc.detail)}${svc.alwaysOn ? ' · starts at login, restarts on crash' : ' · always-on is OFF'}${svc.selfManaged ? ' · this page is served by it' : ''}</div>`;
+
+				const svcActions = svc.supported
+					? `<div class="actions">
+							${svc.installed ? '' : '<button class="primary" onclick="svcOp(\'install\')">Install service</button>'}
+							${svc.installed ? '<button onclick="svcOp(\'uninstall\')" class="danger">Uninstall</button>' : ''}
+							${svc.installed && !svc.running ? '<button class="primary" onclick="svcOp(\'start\')">Start</button>' : ''}
+							${svc.installed && svc.running ? '<button onclick="svcOp(\'stop\')">Stop</button>' : ''}
+						</div>
+						<div class="cb">
+							<input type="checkbox" id="svcAlways" ${svc.alwaysOn ? 'checked' : ''} ${svc.installed ? '' : 'disabled'}
+								onchange="svcAutostart(this.checked)" />
+							<span>Always on — start at login and restart after a crash</span>
+						</div>
+						<div class="hint">${esc(svc.unitPath || '')}</div>
+						<div class="hint">log: ${esc(svc.logFile || '')}</div>`
+					: '';
+
+				const rows = (cfg.fields || [])
+					.map((f) => {
+						const id = fieldId(f.key);
+						const restart = !f.hot;
+						// One tag, not two: "pending restart" already says it needs a restart.
+						const mark = pending.includes(f.key)
+							? ' <span class="tag err">pending restart</span>'
+							: restart
+								? ' <span class="tag">needs restart</span>'
+								: '';
+						const label = `<label for="${id}">${esc(f.label)}${mark} <span class="k">${esc(f.key)}</span></label>`;
+
+						if (f.kind === 'boolean') {
+							return `<div class="field${restart ? ' restart' : ''} cb">
+								<input type="checkbox" id="${id}" ${f.value ? 'checked' : ''} />
+								<span>${esc(f.label)}${mark}</span>
+							</div>`;
+						}
+						if (f.kind === 'enum' || f.key === 'defaultAgent') {
+							const options = (f.kind === 'enum' ? f.values : cfg.agents) || [];
+							return `<div class="field${restart ? ' restart' : ''}">${label}
+								<select id="${id}">${options.map((v) => `<option value="${esc(v)}" ${String(f.value) === String(v) ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
+							</div>`;
+						}
+						const type = f.kind === 'number' ? 'number' : 'text';
+						const attrs = [f.min !== undefined ? `min="${f.min}"` : '', f.max !== undefined ? `max="${f.max}"` : '']
+							.filter(Boolean)
+							.join(' ');
+						return `<div class="field${restart ? ' restart' : ''}">${label}
+							<input type="${type}" id="${id}" ${attrs} value="${esc(f.value === null ? '' : f.value)}"
+								placeholder="${f.nullable ? 'empty = unset' : ''}" />
+						</div>`;
+					})
+					.join('');
+
+				return `${cfg.error ? `<div class="banner bad">config.json ignored: ${esc(cfg.error)}<br>The board is running on defaults. Saving here writes a clean file.</div>` : ''}
+					${pending.length ? `<div class="banner warn">Saved, but not in use yet: ${esc(pending.join(', '))}. Restart the board to apply.</div>` : ''}
+					<details class="group" open><summary>Service</summary><div class="group-body">${svcLine}${svcActions}</div></details>
+					<details class="group" open><summary>Board<span class="n">${(cfg.fields || []).length} settings</span></summary><div class="group-body">${rows}</div></details>`;
+			}
+
+			function paintSettings() {
+				document.getElementById('setPath').textContent = (settings && settings.file) || '';
+				document.getElementById('setBody').innerHTML = settingsBody();
+			}
+
+			async function openSettings() {
+				if (selectedId) closePanel();
+				document.getElementById('setpanel').classList.remove('hidden');
+				document.getElementById('setMsg').textContent = 'loading…';
+				try {
+					[settings, service] = await Promise.all([api('/api/config'), api('/api/service')]);
+					document.getElementById('setMsg').textContent = '';
+					paintSettings();
+				} catch (e) {
+					document.getElementById('setMsg').textContent = e.message;
+					document.getElementById('setMsg').className = 'msg bad';
+				}
+			}
+
+			function closeSettings() {
+				document.getElementById('setpanel').classList.add('hidden');
+			}
+
+			function settingsOpen() {
+				return !document.getElementById('setpanel').classList.contains('hidden');
+			}
+
+			/** Only what actually changed is sent, so one edit cannot rewrite the whole file. */
+			function settingsPatch() {
+				const patch = {};
+				for (const f of (settings || {}).fields || []) {
+					const el = document.getElementById(fieldId(f.key));
+					if (!el) continue;
+					if (f.kind === 'boolean') {
+						if (el.checked !== Boolean(f.value)) patch[f.key] = el.checked;
+						continue;
+					}
+					const raw = el.value.trim();
+					if (f.kind === 'number') {
+						if (raw === '') continue;
+						if (Number(raw) !== Number(f.value)) patch[f.key] = Number(raw);
+						continue;
+					}
+					const before = f.value === null ? '' : String(f.value);
+					if (raw === before) continue;
+					patch[f.key] = raw === '' ? null : raw;
+				}
+				return patch;
+			}
+
+			async function saveSettings() {
+				const msg = document.getElementById('setMsg');
+				const patch = settingsPatch();
+				if (Object.keys(patch).length === 0) {
+					msg.className = 'msg';
+					msg.textContent = 'nothing changed';
+					return;
+				}
+				try {
+					const result = await api('/api/config', 'PATCH', patch);
+					settings = result;
+					msg.className = 'msg ok';
+					msg.textContent = `saved ${Object.keys(patch).length} setting${Object.keys(patch).length === 1 ? '' : 's'}` +
+						(result.restartRequired && result.restartRequired.length ? ' · restart needed' : '');
+					paintSettings();
+					await refresh();
+				} catch (e) {
+					msg.className = 'msg bad';
+					msg.textContent = e.message;
+				}
+			}
+
+			async function svcOp(op, body) {
+				const msg = document.getElementById('setMsg');
+				msg.className = 'msg';
+				msg.textContent = `${op}…`;
+				try {
+					const result = await api(`/api/service/${op}`, 'POST', body ?? {});
+					service = result.state || (await api('/api/service'));
+					msg.className = 'msg ok';
+					msg.textContent = `${op} done`;
+					paintSettings();
+				} catch (e) {
+					msg.className = 'msg bad';
+					msg.textContent = e.message;
+				}
+			}
+
+			async function svcAutostart(enabled) {
+				await svcOp('autostart', { enabled });
+			}
+
+			/**
+			 * The board restarts by exiting and letting the service manager start the
+			 * replacement, so this page has to survive the gap: it polls until the new
+			 * process answers instead of leaving a dead panel on screen.
+			 */
+			async function restartService(force) {
+				const msg = document.getElementById('setMsg');
+				msg.className = 'msg';
+				msg.textContent = 'restarting…';
+				try {
+					await api('/api/service/restart', 'POST', { force: force === true });
+				} catch (e) {
+					if (/still running/.test(e.message) && confirm(`${e.message}\n\nRestart anyway and interrupt them?`)) {
+						return restartService(true);
+					}
+					msg.className = 'msg bad';
+					msg.textContent = e.message;
+					return;
+				}
+
+				for (let i = 0; i < 30; i += 1) {
+					await new Promise((r) => setTimeout(r, 1000));
+					try {
+						[settings, service] = await Promise.all([api('/api/config'), api('/api/service')]);
+						msg.className = 'msg ok';
+						msg.textContent = 'back up';
+						paintSettings();
+						await refresh();
+						return;
+					} catch {
+						msg.textContent = `restarting… ${i + 1}s`;
+					}
+				}
+				msg.className = 'msg bad';
+				msg.textContent = 'still down — check kanban service status';
+			}
+
+			document.getElementById('settings').onclick = () => (settingsOpen() ? closeSettings() : openSettings());
+
 			async function refresh() {
 				try {
 					snapshot = await api('/api/state');
@@ -1110,7 +1360,9 @@
 			// Two habits people already have: Esc closes, and the browser warns before a
 			// reload throws work away.
 			document.addEventListener('keydown', (e) => {
-				if (e.key === 'Escape' && selectedId) closePanel();
+				if (e.key !== 'Escape') return;
+				if (settingsOpen()) closeSettings();
+				else if (selectedId) closePanel();
 			});
 			window.addEventListener('beforeunload', (e) => {
 				if (isDirty()) e.preventDefault();

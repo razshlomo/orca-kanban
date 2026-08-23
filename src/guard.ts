@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import type { SchedulerStatus } from './types.ts';
 
 /** Marker written into a card's worktree while its agent is running. */
 export type CardMarker = {
@@ -86,7 +87,7 @@ export class CardWorkerGuardError extends Error {
 }
 
 /** Commands that change the board or drive the scheduler. */
-const MUTATING = new Set(['card add', 'card move', 'card rm', 'card retry', 'serve', 'run', 'recover']);
+const MUTATING = new Set(['card add', 'card move', 'card rm', 'card retry', 'serve', 'run', 'recover', 'service']);
 
 export function isMutatingCommand(command: string): boolean {
 	return MUTATING.has(command);
@@ -106,4 +107,53 @@ export function assertBoardWritable(
 	if (!isMutatingCommand(command)) return marker;
 	if (options.force) return marker;
 	throw new CardWorkerGuardError(command, marker);
+}
+
+/**
+ * Refuses to start a second scheduler against the same board.
+ *
+ * Until now the HTTP port was the only lock: `serve` cannot bind a port another board
+ * already holds, but `run` binds nothing and stamps its own pid into `scheduler_state`,
+ * so a stray `kanban run` beside a running board becomes a second watcher on the same
+ * Orca sessions — two loops settling one card, closing one terminal, writing one row.
+ * The board's claim transaction caps concurrent *cards*; it says nothing about
+ * concurrent *loops*. With the board running as a background service that stops being
+ * an edge case, so it is refused outright.
+ */
+export class SchedulerBusyError extends Error {
+	readonly ownerPid: number;
+
+	constructor(command: string, ownerPid: number, reason: string) {
+		super(
+			[
+				`Refusing to run "${command}": another scheduler is already watching this board (${reason}).`,
+				'',
+				'Two schedulers on one board would both drive the same agent sessions.',
+				'',
+				'  see it:   kanban status',
+				'  stop it:  kanban service stop   (if it runs as a service)',
+				'            or Ctrl+C in the terminal running it',
+				'',
+				'Read-only commands and card edits still work while it runs.',
+			].join('\n'),
+		);
+		this.name = 'SchedulerBusyError';
+		this.ownerPid = ownerPid;
+	}
+}
+
+/**
+ * Throws when a live scheduler owns the board. `live` comes from `schedulerLiveness`,
+ * which checks the owning pid and its heartbeat — a crashed owner does not block a
+ * restart, which is what makes an always-on service safe to kill and respawn.
+ */
+export function assertSchedulerFree(
+	command: string,
+	status: SchedulerStatus,
+	live: { alive: boolean; reason: string },
+): void {
+	if (!live.alive || status.ownerPid === null) return;
+	// Our own row, from a previous loop in this same process.
+	if (status.ownerPid === process.pid) return;
+	throw new SchedulerBusyError(command, status.ownerPid, live.reason);
 }

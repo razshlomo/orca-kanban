@@ -1,5 +1,5 @@
 import { Board } from './board.ts';
-import { loadConfig } from './config.ts';
+import { loadConfig, loadConfigSafe, readConfigField, saveConfig, writeConfigField } from './config.ts';
 import { openDb } from './db.ts';
 import { createOrcaExecutor } from './executor.ts';
 import { createLogger, type Logger } from './logger.ts';
@@ -21,6 +21,11 @@ import type { Card, CardState, KanbanConfig } from './types.ts';
 export type App = {
 	board: Board;
 	config: KanbanConfig;
+	/**
+	 * Why the config on disk was ignored, if it was. `serve` starts on defaults rather
+	 * than dying, so the board you would use to fix a broken config.json is still there.
+	 */
+	configError: string | null;
 	orca: OrcaApi;
 	orchestration: OrchestrationApi;
 	scheduler: Scheduler;
@@ -47,6 +52,16 @@ export type App = {
 	 * how a card whose deliverable was an answer rather than code ends.
 	 */
 	drop: (id: string, options?: { force?: boolean }) => Promise<{ card: Card; outcome: DropOutcome }>;
+	/**
+	 * Writes a config patch to disk and applies the fields that can take effect in
+	 * place. Returns the keys that cannot: those are captured at boot (the bound port,
+	 * the orchestration client) and need the process restarted to mean anything.
+	 */
+	applyConfig: (patch: Record<string, unknown>) => {
+		applied: string[];
+		restartRequired: string[];
+		replacedBroken: string | null;
+	};
 	close: () => void;
 };
 
@@ -59,13 +74,18 @@ export type App = {
 export function createApp(
 	options: {
 		config?: Partial<KanbanConfig>;
+		/** Start on defaults and report a broken config instead of throwing. */
+		tolerateBadConfig?: boolean;
 		dbPath?: string;
 		orca?: OrcaApi;
 		log?: Logger;
 		orchestration?: OrchestrationApi;
 	} = {},
 ): App {
-	const config = loadConfig(options.config ?? {});
+	const loaded = options.tolerateBadConfig
+		? loadConfigSafe(options.config ?? {})
+		: { config: loadConfig(options.config ?? {}), error: null };
+	const config = loaded.config;
 	const log = options.log ?? createLogger();
 	const board = new Board(options.dbPath ? openDb(options.dbPath) : openDb());
 	const orca = options.orca ?? new OrcaCli();
@@ -106,6 +126,7 @@ export function createApp(
 	return {
 		board,
 		config,
+		configError: loaded.error,
 		orca,
 		orchestration,
 		scheduler,
@@ -165,6 +186,34 @@ export function createApp(
 			const dropped = board.recordDrop(id, `Branch and worktree dropped — ${describeDrop(outcome)}.`) ?? card;
 			log.info('dropped a card branch', { cardId: id, detail: describeDrop(outcome) });
 			return { card: dropped, outcome };
+		},
+		applyConfig: (patch) => {
+			// Disk first: it is validated there, so an invalid patch changes neither the
+			// file nor the live process.
+			const saved = saveConfig(patch);
+
+			const live = config as unknown as Record<string, unknown>;
+			for (const key of saved.applied) {
+				// Every consumer reads its value off this one object when it needs it, so
+				// writing here is the whole of "apply".
+				writeConfigField(live, key, readConfigField(saved.config as unknown as Record<string, unknown>, key));
+			}
+
+			// Two fields mean something to the loop rather than to a reader of config.
+			if (saved.applied.includes('autoRun')) scheduler.setAutoRun(config.autoRun);
+			if (saved.applied.includes('enabled') && !config.enabled) scheduler.setAutoRun(false);
+			scheduler.nudge();
+
+			log.info('config updated', {
+				applied: saved.applied.join(',') || undefined,
+				restartRequired: saved.restartRequired.join(',') || undefined,
+			});
+
+			return {
+				applied: saved.applied,
+				restartRequired: saved.restartRequired,
+				replacedBroken: saved.replacedBroken,
+			};
 		},
 		close: () => board.close(),
 	};

@@ -3,6 +3,7 @@
 #   1. a `kanban` wrapper on PATH
 #   2. the skill where omp and Claude Code both look for it (~/.claude/skills)
 #   3. a pointer block in the global AGENTS.md files that codex and cursor read
+#   4. with --service, the background service (launchd agent / systemd user unit)
 #
 # Idempotent: re-running refreshes the skill and rewrites the AGENTS.md block in
 # place, so an updated block reaches agents that were set up earlier.
@@ -71,5 +72,19 @@ add_block() {
 
 add_block "$HOME/.codex/AGENTS.md"
 add_block "$HOME/AGENTS.md"
+
+# ------------------------------------------------------- 4. background service
+# Opt-in: installing a service that starts at login is not something a setup script
+# should decide for you. PATH is captured from *this* shell, which is why it is
+# installed from here rather than from a stripped environment later.
+if [ "${1:-}" = "--service" ]; then
+	node "$REPO_DIR/src/cli.ts" service install
+# `service status` exits 0 only when a unit is installed, so the state is read from
+# the one place that knows where units live rather than guessed at here.
+elif node "$REPO_DIR/src/cli.ts" service status >/dev/null 2>&1; then
+	say "background service" "installed — refresh it with: kanban service install"
+else
+	say "background service" "not installed — run: kanban service install"
+fi
 
 printf '\nDone. Try: kanban help\n'

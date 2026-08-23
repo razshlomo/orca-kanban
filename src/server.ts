@@ -2,9 +2,17 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { EDITABLE_FIELDS, configPath, readConfigField } from './config.ts';
 import { gitReviewDiff } from './git.ts';
 import { commitCardWork, describeDrop, describeLanding, planLanding } from './land.ts';
 import { describeResume, resumeCardSession } from './resume.ts';
+import {
+	installService,
+	serviceState,
+	startService,
+	stopService,
+	uninstallService,
+} from './service.ts';
 import { parseDueAt } from './text.ts';
 import { BoardRuleError, schedulerLiveness } from './board.ts';
 import type { App } from './app.ts';
@@ -47,6 +55,33 @@ function str(v: unknown): string | undefined {
 }
 function num(v: unknown): number | undefined {
 	return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+function bool(v: unknown): boolean | undefined {
+	return typeof v === 'boolean' ? v : undefined;
+}
+
+/**
+ * Per-server state that is not the board's business.
+ *
+ * `restartPending` remembers settings that were saved but cannot take effect until the
+ * process restarts (the bound port, the orchestration client). Without it the UI would
+ * show a saved value that the running board is not actually using.
+ */
+type Session = { restartPending: Set<string> };
+
+function configView(app: App, session: Session): Record<string, unknown> {
+	const live = app.config as unknown as Record<string, unknown>;
+	return {
+		file: configPath(),
+		error: app.configError,
+		restartPending: [...session.restartPending],
+		agents: Object.keys(app.config.agents),
+		fields: Object.entries(EDITABLE_FIELDS).map(([key, spec]) => ({
+			key,
+			...spec,
+			value: readConfigField(live, key) ?? null,
+		})),
+	};
 }
 
 function cardInputFrom(body: Record<string, unknown>): Partial<CardInput> & { state?: CardState } {
@@ -101,6 +136,10 @@ function stateSnapshot(app: App): Record<string, unknown> {
 				.map(([name]) => name),
 			mirrorToOrcaBoard: app.config.mirrorToOrcaBoard,
 			orchestrationEnabled: app.config.orchestration.enabled,
+			enabled: app.config.enabled,
+			// Surfaced on every poll so a broken config.json and a pending restart are
+			// visible on the board itself, not only inside the settings panel.
+			error: app.configError,
 		},
 		eligible: app.board.eligibleCards().map((c: Card) => c.id),
 		events: app.board.recentEvents(60),
@@ -116,8 +155,10 @@ function stateSnapshot(app: App): Record<string, unknown> {
  * columns for — priority, dependencies, retries, run history, scheduler controls.
  */
 export function createHttpServer(app: App): Server {
+	const session: Session = { restartPending: new Set() };
+
 	return createServer((req, res) => {
-		void handle(app, req, res).catch((err: Error) => {
+		void handle(app, session, req, res).catch((err: Error) => {
 			if (res.headersSent) return;
 			// A refused transition is the caller asking for something the board's rules
 			// forbid — a 409 with the reason, not an opaque 500.
@@ -130,7 +171,7 @@ export function createHttpServer(app: App): Server {
 	});
 }
 
-async function handle(app: App, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(app: App, session: Session, req: IncomingMessage, res: ServerResponse): Promise<void> {
 	const url = new URL(req.url ?? '/', 'http://localhost');
 	const route = url.pathname.replace(/\/+$/, '') || '/';
 	const method = req.method ?? 'GET';
@@ -439,6 +480,112 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 
 		send(res, 200, { scheduler: app.board.schedulerStatus() });
 		return;
+	}
+
+	if (route === '/api/config' && method === 'GET') {
+		send(res, 200, configView(app, session));
+		return;
+	}
+
+	if (route === '/api/config' && (method === 'PATCH' || method === 'POST')) {
+		const patch = await readBody(req);
+		try {
+			const result = app.applyConfig(patch);
+			for (const key of result.restartRequired) session.restartPending.add(key);
+			send(res, 200, { ...configView(app, session), ...result });
+		} catch (err) {
+			// A rejected setting is the caller's mistake, and the message is the whole
+			// point of rejecting it — the board is unchanged either way.
+			send(res, 400, { error: (err as Error).message });
+		}
+		return;
+	}
+
+	if (route === '/api/service' && method === 'GET') {
+		send(res, 200, { ...serviceState(), restartPending: [...session.restartPending] });
+		return;
+	}
+
+	if (route.startsWith('/api/service/') && method === 'POST') {
+		const body = await readBody(req);
+		const op = route.slice('/api/service/'.length);
+
+		switch (op) {
+			case 'install': {
+				const { spec, actions } = installService({ alwaysOn: bool(body['alwaysOn']) ?? true });
+				send(res, 200, { state: serviceState(), unitPath: spec.unitPath, actions });
+				return;
+			}
+			case 'uninstall': {
+				const { actions, removed } = uninstallService();
+				send(res, 200, { state: serviceState(), removed, actions });
+				return;
+			}
+			case 'autostart': {
+				// The unit is rewritten rather than edited: RunAtLoad and KeepAlive are one
+				// switch (launchd starts a KeepAlive job at load either way), so this is the
+				// same install with the other value.
+				const { spec, actions } = installService({ alwaysOn: body['enabled'] !== false });
+				send(res, 200, { state: serviceState(), unitPath: spec.unitPath, actions });
+				return;
+			}
+			case 'start':
+				send(res, 200, { state: serviceState(), action: startService() });
+				return;
+			case 'stop':
+				send(res, 200, { action: stopService() });
+				return;
+			case 'restart': {
+				const force = body['force'] === true;
+				const state = serviceState();
+				const busy = app.scheduler.inFlightCards.length;
+
+				// Restarting mid-card means SIGTERM on a running agent. Recovery would
+				// reconcile it on the way back up, but throwing away a card's turn should be
+				// asked for, not implied by clicking Save.
+				if (busy > 0 && !force) {
+					return send(res, 409, {
+						error: `${busy} card${busy === 1 ? '' : 's'} still running. Wait for them, or restart with force.`,
+					});
+				}
+
+				// Only the managed process may restart itself. A board started by hand is not
+				// the board the manager owns: kicking the manager would restart a *different*
+				// process and leave this one running, which is how you end up with two.
+				if (!state.selfManaged) {
+					return send(res, 409, {
+						error: state.installed
+							? 'This board was started by hand, so it is not the one the service manages. ' +
+								'Restart it where you started it, or use: kanban service restart'
+							: 'Not running as a service, so nothing would bring it back. ' +
+								'Install the service first, or restart this process by hand.',
+					});
+				}
+
+				if (!state.alwaysOn) {
+					return send(res, 409, {
+						error:
+							'This board would not come back: the service is installed with always-on off. ' +
+							'Turn always-on on, or restart it from a terminal with: kanban service restart',
+					});
+				}
+
+				send(res, 200, { restarting: true, via: 'exit', state });
+				// Exit cleanly and let the service manager start the replacement. Doing it
+				// from the outside (kickstart) would mean signalling ourselves and racing
+				// our own shutdown.
+				setTimeout(() => {
+					void app.scheduler.stop({ abortCurrent: force }).then(() => {
+						app.log.info('restarting: exiting for the service manager');
+						app.close();
+						process.exit(0);
+					});
+				}, 150).unref();
+				return;
+			}
+			default:
+				return send(res, 404, { error: `unknown service op ${op}` });
+		}
 	}
 
 	send(res, 404, { error: `no route for ${method} ${route}` });

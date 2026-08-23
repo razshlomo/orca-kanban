@@ -104,7 +104,13 @@ kanban status                # scheduler state, current card, eligible ids
 kanban serve                 # board UI on http://localhost:7420
 kanban run --once            # execute exactly one card, then stop
 kanban run                   # foreground loop until Ctrl+C
+kanban service install       # run it in the background, from login onwards
+kanban service status        # where it runs, whether it is up, and its log
 ```
+
+Only one scheduler may watch a board. `serve`, `run`, `run --once` and `recover` are
+refused (exit 5) while another one is alive, because two loops drive the same agent
+sessions. Check `kanban status` first; stop the other one before starting yours.
 
 Auto-run controls live in the UI, or:
 

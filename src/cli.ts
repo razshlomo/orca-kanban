@@ -5,7 +5,16 @@ import { gitReviewDiff } from './git.ts';
 import { describeCommit, commitCardWork, describeDrop, describeLanding } from './land.ts';
 import { describeResume, resumeCardSession } from './resume.ts';
 import { formatRelative, parseDueAt, parseDuration } from './text.ts';
-import { assertBoardWritable, CardWorkerGuardError } from './guard.ts';
+import { assertBoardWritable, assertSchedulerFree, CardWorkerGuardError, SchedulerBusyError } from './guard.ts';
+import {
+	installService,
+	restartService,
+	serviceSpec,
+	serviceState,
+	startService,
+	stopService,
+	uninstallService,
+} from './service.ts';
 import { createHttpServer } from './server.ts';
 import { isCardState, type CardInput, type CardState } from './types.ts';
 
@@ -34,6 +43,9 @@ Usage:
   orca-kanban recover                            Reconcile cards stranded In Progress
   orca-kanban status                             Show board + scheduler status
   orca-kanban doctor                             Check Orca connectivity and config
+  orca-kanban service <op> [--no-autostart]      Run the board as a background service
+                                                 install | uninstall | status | start
+                                                 stop | restart | autostart <on|off>
 
 Card options:
   --description <text>   --acceptance <text>   --priority <n>
@@ -111,6 +123,9 @@ async function main(): Promise<number> {
 	// ------------------------------------------------------------------ serve
 	if (command === 'serve') {
 		const app = createApp({
+			// A board that will not boot cannot be used to fix the config that stopped it
+			// booting — and under a service manager that is a crash loop with no UI.
+			tolerateBadConfig: true,
 			config: {
 				...(flagNum(args, 'port') === undefined ? {} : { port: flagNum(args, 'port') as number }),
 				...(args.flags['auto-run'] ? { autoRun: true } : {}),
@@ -120,10 +135,15 @@ async function main(): Promise<number> {
 			},
 		});
 
-		if (!app.config.enabled) {
-			process.stderr.write('kanban.enabled is false — refusing to start.\n');
-			return 1;
+		if (app.configError) {
+			process.stderr.write(`config ignored: ${app.configError}\n  running on defaults — fix it in Settings\n`);
+			app.log.warn('config ignored', { error: app.configError });
 		}
+
+		// One scheduler per board. The port refuses a second `serve`, but nothing refused
+		// a `run` beside it, and both would drive the same agent sessions.
+		const owner = app.board.schedulerStatus();
+		assertSchedulerFree('serve', owner, schedulerLiveness(owner, app.config.pollIntervalMs));
 
 		const report = await app.recover();
 		if (report.inspected > 0) {
@@ -159,11 +179,20 @@ async function main(): Promise<number> {
 			return 1;
 		}
 
+		const service = serviceState();
 		process.stdout.write(`Orca Kanban board:  http://localhost:${app.config.port}\n`);
-		process.stdout.write(`Auto-run: ${app.config.autoRun ? 'on' : 'off'} · agent: ${app.config.defaultAgent}\n`);
+		process.stdout.write(
+			`Auto-run: ${app.config.enabled && app.config.autoRun ? 'on' : 'off'} · agent: ${app.config.defaultAgent}` +
+				`${service.selfManaged ? ' · managed by ' + service.kind : ''}\n`,
+		);
+		if (!app.config.enabled) {
+			// Serving a disabled board beats exiting: the switch that disabled it lives in
+			// this UI, and a service manager would otherwise restart us into the same wall.
+			process.stdout.write('enabled is false — nothing will be picked up until you turn it on in Settings\n');
+		}
 
 		// The loop always runs; autoRun decides whether it picks cards up.
-		app.scheduler.start({ autoRun: app.config.autoRun });
+		app.scheduler.start({ autoRun: app.config.enabled && app.config.autoRun });
 
 		const shutdown = (): void => {
 			process.stdout.write('\nstopping scheduler…\n');
@@ -187,6 +216,11 @@ async function main(): Promise<number> {
 					? {}
 					: { maxConcurrent: flagNum(args, 'max-concurrent') as number },
 		});
+		// `run --once` executes a card too, so it is a second executor just as much as the
+		// loop is: both are refused while another scheduler owns the board.
+		const runOwner = app.board.schedulerStatus();
+		assertSchedulerFree('run', runOwner, schedulerLiveness(runOwner, app.config.pollIntervalMs));
+
 		await app.recover();
 
 		if (args.flags['once']) {
@@ -528,6 +562,10 @@ async function main(): Promise<number> {
 	// --------------------------------------------------------------- recover
 	if (command === 'recover') {
 		const app = createApp();
+		// Recovery rewrites cards that a live scheduler is currently executing.
+		const recoverOwner = app.board.schedulerStatus();
+		assertSchedulerFree('recover', recoverOwner, schedulerLiveness(recoverOwner, app.config.pollIntervalMs));
+
 		const report = await app.recover();
 		process.stdout.write(
 			`inspected ${report.inspected} · adopted ${report.adopted.length} · requeued ${report.requeued.length} · blocked ${report.blocked.length} · held ${report.held.length}\n`,
@@ -537,6 +575,72 @@ async function main(): Promise<number> {
 		}
 		app.close();
 		return 0;
+	}
+
+	// --------------------------------------------------------------- service
+	if (command === 'service') {
+		const op = args._[1] ?? 'status';
+		// Default on: the point of installing is that it runs without being asked.
+		const alwaysOn = args.flags['no-autostart'] !== true;
+
+		if (op === 'install' || op === 'autostart') {
+			const wanted =
+				op === 'autostart' ? (args._[2] ?? 'on') !== 'off' && (args._[2] ?? 'on') !== 'false' : alwaysOn;
+			const { spec, actions } = installService({ alwaysOn: wanted });
+			process.stdout.write(`unit:       ${spec.unitPath}\n`);
+			process.stdout.write(`runs:       ${spec.nodeBin} ${spec.cliPath} serve\n`);
+			process.stdout.write(`log:        ${spec.logFile}\n`);
+			process.stdout.write(`always on:  ${spec.alwaysOn ? 'yes (starts at login, restarts on crash)' : 'no (start it by hand)'}\n`);
+			for (const action of actions) {
+				if (!action.ok && action.output) process.stdout.write(`  note: ${action.command} — ${action.output}\n`);
+			}
+			const after = serviceState();
+			process.stdout.write(`state:      ${after.detail}\n`);
+			// PATH is captured from this shell, so an install from a stripped environment
+			// would leave the service unable to find `orca` or the agent CLIs.
+			if (!process.env['PATH']?.includes('/')) process.stdout.write('warning: this shell has no usable PATH\n');
+			return 0;
+		}
+
+		if (op === 'uninstall') {
+			const { actions, removed } = uninstallService();
+			process.stdout.write(removed ? `removed:    ${removed}\n` : 'nothing to remove\n');
+			for (const action of actions) {
+				if (!action.ok && action.output) process.stdout.write(`  note: ${action.command} — ${action.output}\n`);
+			}
+			return 0;
+		}
+
+		if (op === 'start' || op === 'stop' || op === 'restart') {
+			const action = op === 'start' ? startService() : op === 'stop' ? stopService() : restartService();
+			process.stdout.write(`${action.command}\n`);
+			if (action.output) process.stdout.write(`${action.output}\n`);
+			if (!action.ok) return 1;
+			process.stdout.write(`state:      ${serviceState().detail}\n`);
+			return 0;
+		}
+
+		if (op === 'status') {
+			const state = serviceState();
+			if (!state.supported) {
+				process.stdout.write(`${state.detail}\n`);
+				return 1;
+			}
+			process.stdout.write(`manager:    ${state.kind}\n`);
+			process.stdout.write(`unit:       ${state.unitPath}${state.installed ? '' : ' (not installed)'}\n`);
+			process.stdout.write(`state:      ${state.detail}\n`);
+			process.stdout.write(`always on:  ${state.alwaysOn ? 'yes' : 'no'}\n`);
+			if (state.lastExitStatus !== null) process.stdout.write(`last exit:  ${state.lastExitStatus}\n`);
+			process.stdout.write(`log:        ${state.logFile}\n`);
+			if (!state.installed) {
+				const spec = serviceSpec();
+				process.stdout.write(`\nInstall it with: kanban service install\n  would run: ${spec.nodeBin} ${spec.cliPath} serve\n`);
+			}
+			return state.installed ? 0 : 1;
+		}
+
+		process.stderr.write(`unknown service op "${op}" — try install | uninstall | status | start | stop | restart | autostart <on|off>\n`);
+		return 1;
 	}
 
 	// ---------------------------------------------------------------- status
@@ -550,10 +654,16 @@ async function main(): Promise<number> {
 		const inFlight = app.board.inFlightCount();
 		// The row survives the process, so say plainly when nothing is watching the board.
 		const live = schedulerLiveness(s, app.config.pollIntervalMs);
+		const service = serviceState();
 		process.stdout.write(
 			live.alive
 				? `scheduler: ${s.runState}${s.autoRun ? ' (auto-run on)' : ' (auto-run off)'} · ${live.reason}\n`
-				: `scheduler: not running (${live.reason}) · start it with: kanban serve\n`,
+				: `scheduler: not running (${live.reason}) · start it with: ${service.installed ? 'kanban service start' : 'kanban serve'}\n`,
+		);
+		process.stdout.write(
+			service.installed
+				? `service:   ${service.detail}${service.alwaysOn ? ' · always on' : ' · always on: no'} (${service.kind})\n`
+				: `service:   not installed · run it in the background with: kanban service install\n`,
 		);
 		process.stdout.write(`slots:     ${inFlight}/${app.config.maxConcurrent} in flight\n`);
 		for (const flight of s.inFlight) {
@@ -609,6 +719,14 @@ async function main(): Promise<number> {
 		process.stdout.write(`success state:  ${app.config.successState}\n`);
 		process.stdout.write(`orca board:     ${app.config.mirrorToOrcaBoard ? 'mirroring' : 'off'}\n`);
 
+		const service = serviceState();
+		process.stdout.write(
+			`service:        ${service.installed ? `${service.detail}${service.alwaysOn ? ', always on' : ''}` : 'not installed'}\n`,
+		);
+		// launchd hands a job a bare PATH, so a service that cannot see `orca` or the
+		// agent CLIs is the failure this line exists to catch before a card does.
+		if (service.selfManaged) process.stdout.write(`service PATH:   ${process.env['PATH'] ?? '(unset)'}\n`);
+
 		if (app.config.orchestration.enabled) {
 			const ok = await app.orchestration.available();
 			process.stdout.write(`orchestration:  ${ok ? 'available' : 'UNAVAILABLE (enable it in Settings > Experimental)'}\n`);
@@ -649,7 +767,15 @@ main()
 	})
 	.catch((err: Error) => {
 		// The guard message is already formatted for a human/agent to act on.
-		const refused = err instanceof CardWorkerGuardError || err instanceof BoardRuleError;
+		const refused =
+			err instanceof CardWorkerGuardError || err instanceof BoardRuleError || err instanceof SchedulerBusyError;
 		process.stderr.write(refused ? `${err.message}\n` : `error: ${err.message}\n`);
-		process.exitCode = err instanceof CardWorkerGuardError ? 3 : err instanceof BoardRuleError ? 4 : 1;
+		process.exitCode =
+			err instanceof CardWorkerGuardError
+				? 3
+				: err instanceof BoardRuleError
+					? 4
+					: err instanceof SchedulerBusyError
+						? 5
+						: 1;
 	});

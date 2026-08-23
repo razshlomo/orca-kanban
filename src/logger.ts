@@ -1,7 +1,17 @@
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { kanbanHome } from './config.ts';
+import { SERVICE_ENV_FLAG } from './service.ts';
 import type { BoardEvent } from './types.ts';
+
+/**
+ * Rotate at 8 MB, keeping one previous file.
+ *
+ * A board that runs for months as a service writes here forever, and nothing else
+ * would ever trim it: this log was already megabytes after a week of hand-started
+ * runs.
+ */
+const MAX_LOG_BYTES = 8 * 1024 * 1024;
 
 export type LogFields = {
 	cardId?: string | null;
@@ -22,10 +32,21 @@ export type Logger = {
  * known so a board decision, an Orca session, and a CardRun can be correlated.
  */
 export function createLogger(options: { file?: string | null; stderr?: boolean } = {}): Logger {
-	const stderr = options.stderr ?? true;
+	// Under a service manager stderr is redirected into the service log, so writing
+	// every line to both would duplicate the whole log into a file nothing rotates.
+	const stderr = options.stderr ?? process.env[SERVICE_ENV_FLAG] !== '1';
 	const file = options.file === undefined ? path.join(kanbanHome(), 'scheduler.log') : options.file;
 
 	if (file) mkdirSync(path.dirname(file), { recursive: true });
+
+	let bytes = 0;
+	if (file) {
+		try {
+			bytes = statSync(file).size;
+		} catch {
+			// No log yet.
+		}
+	}
 
 	const write = (level: string, kind: string, fields: LogFields): void => {
 		const line = JSON.stringify({
@@ -43,6 +64,11 @@ export function createLogger(options: { file?: string | null; stderr?: boolean }
 		if (file) {
 			try {
 				appendFileSync(file, `${line}\n`);
+				bytes += line.length + 1;
+				if (bytes > MAX_LOG_BYTES) {
+					renameSync(file, `${file}.1`);
+					bytes = 0;
+				}
 			} catch {
 				// Never let logging break execution.
 			}
