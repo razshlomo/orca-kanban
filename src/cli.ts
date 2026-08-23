@@ -2,7 +2,7 @@
 import { createApp } from './app.ts';
 import { BoardRuleError, schedulerLiveness } from './board.ts';
 import { gitReviewDiff } from './git.ts';
-import { describeLanding, landCardWork } from './land.ts';
+import { describeCommit, commitCardWork, describeDrop, describeLanding } from './land.ts';
 import { describeResume, resumeCardSession } from './resume.ts';
 import { formatRelative, parseDueAt, parseDuration } from './text.ts';
 import { assertBoardWritable, CardWorkerGuardError } from './guard.ts';
@@ -29,6 +29,8 @@ Usage:
   orca-kanban card takeover <id>                 Interrupt the agent and take its session
   orca-kanban card takeback <id>                 Give the session back to the board
   orca-kanban card resume <id>                   Reopen the agent's conversation for a card
+  orca-kanban card land <id> [--keep-branch]     Merge an approved card into the base branch
+  orca-kanban card drop <id> [--force]           Throw away its branch, keep the card and trail
   orca-kanban recover                            Reconcile cards stranded In Progress
   orca-kanban status                             Show board + scheduler status
   orca-kanban doctor                             Check Orca connectivity and config
@@ -44,19 +46,34 @@ States: Backlog | Ready | "In Progress" | Review | Done | Blocked
 
 type Args = { _: string[]; flags: Record<string, string | boolean> };
 
-function parseArgs(argv: string[]): Args {
+/**
+ * Long flags (`--priority 5`) and single-letter short flags (`-m "text"`).
+ *
+ * Short flags are not decoration: the usage text and the reject error message both
+ * tell people to write `-m`, and while only `--` was parsed that text went into the
+ * positionals — approving with `-m "looks right"` silently recorded no comment, and
+ * rejecting recorded the literal "-m " along with the reason.
+ *
+ * Only `-x` is a short flag. `-5` is a value, so `--priority -5` still works.
+ */
+export function parseArgs(argv: string[]): Args {
 	const out: Args = { _: [], flags: {} };
+	const isFlag = (token: string): boolean => token.startsWith('--') || /^-[a-zA-Z]$/.test(token);
+
 	for (let i = 0; i < argv.length; i += 1) {
 		const token = argv[i] as string;
-		if (token.startsWith('--')) {
-			const key = token.slice(2);
-			const next = argv[i + 1];
-			if (next === undefined || next.startsWith('--')) out.flags[key] = true;
-			else {
-				out.flags[key] = next;
-				i += 1;
-			}
-		} else out._.push(token);
+		if (!isFlag(token)) {
+			out._.push(token);
+			continue;
+		}
+
+		const key = token.startsWith('--') ? token.slice(2) : token.slice(1);
+		const next = argv[i + 1];
+		if (next === undefined || isFlag(next)) out.flags[key] = true;
+		else {
+			out.flags[key] = next;
+			i += 1;
+		}
 	}
 	return out;
 }
@@ -324,14 +341,14 @@ async function main(): Promise<number> {
 				if (!existing) throw new Error(`no such card ${id}`);
 
 				// Then commit, so "Done" never means "finished, files lost".
-				const landing = await landCardWork(existing, app.config);
+				const landing = await commitCardWork(existing, app.config);
 				if (landing.committed) app.board.recordCommit(id, landing.sha);
 
 				const comment = flagStr(args, 'm') ?? flagStr(args, 'comment');
 				const card = app.board.approveCard(id, comment !== undefined ? { comment } : {});
 				if (!card) throw new Error(`no such card ${id}`);
 				await app.mirrorCard(card, 'approved by review');
-				process.stdout.write(`${card.id} -> ${card.state} (approved; ${describeLanding(landing)})\n`);
+				process.stdout.write(`${card.id} -> ${card.state} (approved; ${describeCommit(landing)})\n`);
 				return 0;
 			}
 
@@ -430,6 +447,41 @@ async function main(): Promise<number> {
 				return 0;
 			}
 
+			if (sub === 'land') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+
+				const { card, outcome } = await app.land(id, { keepBranch: args.flags['keep-branch'] === true });
+				if (!outcome.landed) {
+					process.stderr.write(`cannot land ${id}: ${describeLanding(outcome)}\n`);
+					return 1;
+				}
+				process.stdout.write(
+					`${card.id} -> ${describeLanding(outcome)}\n` +
+						(outcome.verified ? `verified with: ${app.config.verifyCommand}\n` : '') +
+						(outcome.disposed ? '' : `the branch is still there; remove it with: kanban card drop ${card.id}\n`),
+				);
+				return 0;
+			}
+
+			if (sub === 'drop') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+
+				const { card, outcome } = await app.drop(id, { force: args.flags['force'] === true });
+				if (!outcome.dropped) {
+					process.stderr.write(
+						`cannot drop ${id}: ${describeDrop(outcome)}\n` +
+							(outcome.reason === 'unlanded'
+								? `land it first with: kanban card land ${id}\n`
+								: ''),
+					);
+					return 1;
+				}
+				process.stdout.write(`${card.id} -> ${describeDrop(outcome)} (the card, its summary and its trail stay)\n`);
+				return 0;
+			}
+
 			if (sub === 'resume') {
 				const id = args._[2];
 				if (!id) throw new Error('a card id is required');
@@ -517,6 +569,18 @@ async function main(): Promise<number> {
 		process.stdout.write(`executed:  ${s.cardsExecuted}\n`);
 		process.stdout.write(`cards:     ${[...byState].map(([k, v]) => `${k}=${v}`).join(' ') || 'none'}\n`);
 		process.stdout.write(`eligible:  ${app.board.eligibleCards().map((c) => c.id).join(', ') || 'none'}\n`);
+
+		// Approving commits on the card's own branch and stops there, so finished cards
+		// accumulate branches until somebody lands or drops them. Nothing else says so.
+		const unlanded = app.board.unlandedCards();
+		if (unlanded.length > 0) {
+			process.stdout.write(
+				`unlanded:  ${unlanded.length} Done card${unlanded.length === 1 ? '' : 's'} still carrying a branch\n`,
+			);
+			for (const c of unlanded) {
+				process.stdout.write(`  ${c.id} · ${c.branch ?? 'no branch'} · land or drop it\n`);
+			}
+		}
 
 		const wakeAt = app.board.nextWakeAt();
 		if (wakeAt !== null) {

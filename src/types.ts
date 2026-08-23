@@ -81,6 +81,15 @@ export type Card = {
   branch: string | null;
   worktreePath: string | null;
   commitSha: string | null;
+  /**
+   * The merge commit that put this card's branch into the base branch, and when.
+   *
+   * `commitSha` says the work exists on its own branch; this says it has been
+   * published. Landing is deliberate and separate, so this stays null for every card
+   * whose deliverable was an answer rather than code.
+   */
+  landedSha: string | null;
+  landedAt: number | null;
   /** Orca worktree id (`<repoId>::<path>`) — this card's card on Orca's own board. */
   worktreeId: string | null;
   /** Orca orchestration Task/Dispatch ids, when provenance is enabled. */
@@ -248,6 +257,16 @@ export type KanbanConfig = {
    * own branch, which is preserved and reviewable without touching the base branch.
    */
   landOnApprove: 'commit' | 'off';
+  /**
+   * Shell command that must succeed inside a card's worktree before `land` will merge
+   * it into the base branch. `null` means no gate.
+   *
+   * The board never runs tests of its own: a card reaches Review because an agent said
+   * it was finished. That is fine for a branch nobody else reads, and not fine for the
+   * branch everyone builds from, so this is the one place a project can insist on
+   * evidence before its shared history changes.
+   */
+  verifyCommand: string | null;
   /** Orca repo selector or path used when a card does not name one. */
   defaultRepo: string | null;
   /** Base ref for each card's worktree; null uses the repo default. */
@@ -335,6 +354,8 @@ export type BoardEvent =
   | 'card_recovered'
   | 'card_handed_over'
   | 'card_taken_back'
+  | 'card_landed'
+  | 'card_dropped'
   | 'session_closed'
   | 'board_changed'
   | 'scheduler_state';

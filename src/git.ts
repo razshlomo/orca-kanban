@@ -168,3 +168,116 @@ export async function gitCommitAll(cwd: string, message: string): Promise<Commit
 	const sha = await run(cwd, ['rev-parse', 'HEAD']);
 	return sha ? { committed: true, sha, files } : { committed: false, reason: 'failed', error: 'could not read HEAD' };
 }
+
+/**
+ * Like `run`, but keeps git's own words. A merge that fails has something to say —
+ * which files conflicted, why a branch is not fast-forwardable — and swallowing it
+ * into `null` would leave the caller inventing an explanation.
+ */
+function runDetailed(
+	cwd: string,
+	args: string[],
+	timeoutMs = 60_000,
+): Promise<{ ok: boolean; out: string; err: string }> {
+	const { promise, resolve } = Promise.withResolvers<{ ok: boolean; out: string; err: string }>();
+	execFile('git', ['-C', cwd, ...args], { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+		resolve({ ok: !err, out: String(stdout ?? '').trim(), err: String(stderr ?? '').trim() });
+	});
+	return promise;
+}
+
+/**
+ * The repository's main working tree, found from any of its worktrees.
+ *
+ * A merge cannot run inside the card's worktree: the base branch is checked out
+ * somewhere else, and git refuses to have one branch in two places. So landing
+ * always happens in the main tree, which is the one holding the shared branch.
+ */
+export async function gitMainWorktree(cwd: string): Promise<string | null> {
+	const common = await run(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+	if (!common) return null;
+	// `<main>/.git` for a normal clone; a bare repo has no working tree to land in.
+	return path.basename(common) === '.git' ? path.dirname(common) : null;
+}
+
+/** Where a card's branch stands against the branch it would land on. */
+export type BranchStanding = {
+	/** Commits on the card branch that the base does not have. */
+	ahead: number;
+	/** Commits the base has that the card branch does not — how stale the work is. */
+	behind: number;
+	/** Already contained in the base, so there is nothing left to land. */
+	merged: boolean;
+};
+
+export async function gitBranchStanding(cwd: string, branch: string, base: string): Promise<BranchStanding | null> {
+	const counts = await run(cwd, ['rev-list', '--left-right', '--count', `${base}...${branch}`]);
+	if (counts === null) return null;
+	// `rev-list --left-right --count base...branch` prints "<behind>\t<ahead>".
+	const [behind = NaN, ahead = NaN] = counts.split(/\s+/).map(Number);
+	if (!Number.isFinite(behind) || !Number.isFinite(ahead)) return null;
+	return { ahead, behind, merged: ahead === 0 };
+}
+
+export type MergeOutcome =
+	| { merged: true; sha: string }
+	| { merged: false; reason: 'conflict' | 'failed'; error: string };
+
+/**
+ * Merges a card's branch into the base branch, in the main working tree.
+ *
+ * `--no-ff` on purpose: a card is a unit of work someone approved, and a merge commit
+ * is what keeps that boundary visible in the history afterwards. A conflict is undone
+ * immediately — leaving a half-merged index behind would hand the repository back in a
+ * state the board cannot describe and the next command would trip over.
+ */
+export async function gitMergeBranch(
+	mainWorktree: string,
+	options: { branch: string; message: string },
+): Promise<MergeOutcome> {
+	const merge = await runDetailed(mainWorktree, ['merge', '--no-ff', '--no-verify', '-m', options.message, options.branch]);
+	if (!merge.ok) {
+		const conflicted = await run(mainWorktree, ['diff', '--name-only', '--diff-filter=U']);
+		await runDetailed(mainWorktree, ['merge', '--abort']);
+		const files = (conflicted ?? '').split('\n').filter(Boolean);
+		return files.length > 0
+			? { merged: false, reason: 'conflict', error: `conflicts in ${files.join(', ')}` }
+			: { merged: false, reason: 'failed', error: merge.err || merge.out || 'git merge failed' };
+	}
+
+	const sha = await run(mainWorktree, ['rev-parse', 'HEAD']);
+	return sha ? { merged: true, sha } : { merged: false, reason: 'failed', error: 'could not read HEAD after merging' };
+}
+
+/**
+ * Deletes a card's branch. `force` is required for a branch the base does not
+ * contain, because that is the case where deleting destroys work.
+ */
+export async function gitDeleteBranch(
+	mainWorktree: string,
+	branch: string,
+	options: { force?: boolean } = {},
+): Promise<{ deleted: boolean; error?: string }> {
+	const result = await runDetailed(mainWorktree, ['branch', options.force ? '-D' : '-d', branch]);
+	return result.ok ? { deleted: true } : { deleted: false, error: result.err || 'git branch delete failed' };
+}
+
+/**
+ * Whether a branch still exists. Landing checks this instead of trusting the exit code
+ * of its own delete: Orca's `worktree rm` can take the branch with the worktree, and a
+ * `git branch -d` that then fails does not mean the branch survived.
+ */
+export async function gitBranchExists(cwd: string, branch: string): Promise<boolean> {
+	return (await run(cwd, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`])) !== null;
+}
+
+/** The base branch this repository would land on, by name. */
+export async function gitBaseBranch(cwd: string, preferred: string | null): Promise<string | null> {
+	const ref = await resolveBaseRef(cwd, preferred);
+	if (!ref) return null;
+	// A landing target has to be a local branch to merge into; origin/HEAD names a remote.
+	if (!ref.startsWith('origin/')) return ref;
+	const head = await run(cwd, ['rev-parse', '--abbrev-ref', ref]);
+	const local = head?.replace(/^origin\//, '') ?? null;
+	return local && (await run(cwd, ['rev-parse', '--verify', '--quiet', local])) ? local : null;
+}

@@ -46,6 +46,8 @@ function card(over: Partial<Card> = {}): Card {
 		orcaTaskId: null,
 		orcaDispatchId: null,
 		commitSha: null,
+		landedSha: null,
+		landedAt: null,
 		attemptCount: 1,
 		maxAttempts: 2,
 		lastResult: null,

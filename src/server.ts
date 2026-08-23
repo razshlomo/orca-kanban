@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gitReviewDiff } from './git.ts';
-import { landCardWork } from './land.ts';
+import { commitCardWork, describeDrop, describeLanding, planLanding } from './land.ts';
 import { describeResume, resumeCardSession } from './resume.ts';
 import { parseDueAt } from './text.ts';
 import { BoardRuleError, schedulerLiveness } from './board.ts';
@@ -218,6 +218,52 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 			return;
 		}
 
+		// A refused landing is a 409 with the reason, never a silent no-op: the caller
+		// asked to change shared history and deserves to be told exactly what stopped it.
+		if (action === '/land' && method === 'POST') {
+			const keepBranch = (await readBody(req))['keepBranch'] === true;
+			const { card, outcome } = await app.land(id, { keepBranch });
+			if (!outcome.landed) {
+				return send(res, 409, { error: describeLanding(outcome), reason: outcome.reason, card });
+			}
+			send(res, 200, { card, sha: outcome.sha, base: outcome.plan.base, disposed: outcome.disposed, detail: describeLanding(outcome) });
+			return;
+		}
+
+		if (action === '/drop' && method === 'POST') {
+			const force = (await readBody(req))['force'] === true;
+			const { card, outcome } = await app.drop(id, { force });
+			if (!outcome.dropped) {
+				return send(res, 409, {
+					error: describeDrop(outcome),
+					reason: outcome.reason,
+					unlandedCommits: outcome.unlandedCommits ?? 0,
+					card,
+				});
+			}
+			send(res, 200, { card, detail: describeDrop(outcome) });
+			return;
+		}
+
+		// What the Land button may do, without doing it. The answer depends on the state
+		// of the repository, not just the card, so the UI cannot work it out by itself.
+		if (action === '/landable' && method === 'GET') {
+			const card = app.board.getCard(id);
+			if (!card) return send(res, 404, { error: `no such card ${id}` });
+
+			const plan = await planLanding(card, app.config);
+			send(res, 200, {
+				can: plan.landed,
+				reason: plan.landed ? null : plan.reason,
+				why: plan.landed ? null : describeLanding(plan),
+				base: plan.plan?.base ?? null,
+				ahead: plan.plan?.standing.ahead ?? 0,
+				behind: plan.plan?.standing.behind ?? 0,
+				verifyCommand: app.config.verifyCommand,
+			});
+			return;
+		}
+
 		if (action === '/resume' && method === 'POST') {
 			const card = app.board.getCard(id);
 			if (!card) return send(res, 404, { error: `no such card ${id}` });
@@ -265,7 +311,7 @@ async function handle(app: App, req: IncomingMessage, res: ServerResponse): Prom
 			if (!target) return send(res, 404, { error: `no such card ${id}` });
 
 			// Then land the work, so Done never means "finished, changes lost".
-			const landing = await landCardWork(target, app.config);
+			const landing = await commitCardWork(target, app.config);
 			if (landing.committed) app.board.recordCommit(card.id, landing.sha);
 
 			const approved = app.board.approveCard(id, {

@@ -2,42 +2,42 @@
   "enabled": true,
   "autoRun": false,
   "pollIntervalMs": 2000,
-
   "maxConcurrent": 1,
-
   "defaultAgent": "omp",
   "defaultRepo": "/absolute/path/to/your/repo",
-
   "maxAttempts": 2,
   "successState": "Review",
   "landOnApprove": "commit",
-
+  "verifyCommand": null,
   "baseBranch": null,
   "setupPolicy": "inherit",
   "removeWorktreeOnSuccess": false,
   "closeSessionWhenDone": true,
-
   "mirrorToOrcaBoard": true,
-
   "startupGraceMs": 12000,
   "agentPollIntervalMs": 4000,
   "doneConfirmations": 2,
   "resultGraceMs": 180000,
   "cardTimeoutMs": 2700000,
-
   "port": 7420,
   "recoveryPolicy": "ready",
-
   "orchestration": {
     "enabled": true,
     "objective": "Orca Kanban sequential card execution",
     "runId": null
   },
-
   "agents": {
-    "omp": { "orcaAgentId": "omp" },
-    "codex": { "orcaAgentId": "codex" },
-    "claude": { "orcaAgentId": "claude" },
-    "cursor": { "orcaAgentId": "cursor" }
+    "omp": {
+      "orcaAgentId": "omp"
+    },
+    "codex": {
+      "orcaAgentId": "codex"
+    },
+    "claude": {
+      "orcaAgentId": "claude"
+    },
+    "cursor": {
+      "orcaAgentId": "cursor"
+    }
   }
 }

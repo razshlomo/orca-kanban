@@ -55,6 +55,7 @@ export const DEFAULT_CONFIG: KanbanConfig = {
 	maxAttempts: 2,
 	successState: 'Review',
 	landOnApprove: 'commit',
+	verifyCommand: null,
 	defaultRepo: null,
 	baseBranch: null,
 	setupPolicy: 'inherit',

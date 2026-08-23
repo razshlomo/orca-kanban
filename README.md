@@ -351,7 +351,75 @@ cherry-pick), because that is the step that can break somebody else's build.
 
 Set it to `"off"` to leave the worktree untouched. The commit message carries the card
 title, the agent's own summary, and the card id. The card panel warns while work is
-uncommitted, and shows the short sha once it is landed.
+uncommitted, and shows the short sha once it is committed.
+
+### Landing a card on the base branch
+
+Approving publishes nothing. It commits on the card's own branch and stops, so a finished
+card leaves a branch behind — and those accumulate quietly until something says so:
+
+```
+$ kanban status
+unlanded:  9 Done cards still carrying a branch
+  card_18374d02 · kanban-verify-the-slack-cost-alerts-18374d02 · land or drop it
+```
+
+Cards come in two kinds, and only one of them has anything to merge:
+
+| Kind of card | What the deliverable is | How it ends |
+| --- | --- | --- |
+| Code — "add a divide function" | the branch | `kanban card land <id>` |
+| A question — "confirm the alert self-silenced" | the answer, already on the board | `kanban card drop <id>` |
+
+That second row is most cards, in practice. An investigation agent leaves notes in its
+worktree — typically `FINDINGS.md` — and merging those would push scratch notes into the
+repository. Several such cards write the *same* filenames, so merging the second one is
+a conflict by construction. Dropping keeps the card, its summary and its whole review
+trail, and throws away only the branch.
+
+```bash
+kanban card land <id>                 # merge --no-ff into the base branch, then dispose
+kanban card land <id> --keep-branch   # merge, leave the branch and worktree alone
+kanban card drop <id>                 # delete branch + worktree, keep the card and trail
+kanban card drop <id> --force         # ... even though the base branch lacks those commits
+```
+
+**Landing is never automatic.** There is no `landOnApprove: "merge"`, on purpose: the
+board runs no tests of its own (a card reaches Review because an agent said it was
+finished), cards branch from the base when they *start*, so a card approved days later
+would land stale work, and every other board action is recoverable while a pushed merge
+is public history.
+
+What it refuses, and why — the same sentence from the CLI, the API and the button's
+tooltip:
+
+| Refusal | Meaning |
+| --- | --- |
+| `not-done` | only an approved card can be landed |
+| `held-by-you` | you have taken this card by hand; take it back first |
+| `nothing-committed` | the card produced no commit |
+| `worktree-dirty` | loose files the merge would leave behind, named |
+| `base-not-checked-out` | the repository is on another branch — it is never switched under you |
+| `base-dirty` | your own uncommitted work would be mixed in |
+| `nothing-to-merge` | the base branch already has it |
+| `verify-failed` | the gate below failed; its output is included |
+| `conflict` | the merge was aborted, nothing changed, the files are named |
+| `already-landed` | it has a merge sha already |
+
+A conflict leaves **nothing** behind: the merge is aborted, `HEAD` does not move, and the
+branch is not disposed of, so retrying after a rebase is safe.
+
+Because the board itself never runs tests, one setting can insist on evidence before the
+shared branch changes. It runs inside the *card's* worktree, and its output is shown on
+failure:
+
+```json
+{ "verifyCommand": "npm test" }
+```
+
+Dropping a branch the base does not contain is refused once and needs `--force` (the UI
+asks for confirmation), because that is the case where dropping destroys work. After
+landing, dropping is free.
 
 ### The board refuses what makes no sense
 
@@ -675,6 +743,9 @@ columns for.
 | POST | `/api/cards/:id/reject` | send it back → Ready, reason required |
 | GET/POST | `/api/cards/:id/comments` | read or append to the review trail |
 | GET | `/api/cards/:id/diff` | the card patch, untracked files included |
+| POST | `/api/cards/:id/land` | merge into the base branch; 409 with the reason if refused |
+| POST | `/api/cards/:id/drop` | delete branch + worktree; `{ "force": true }` to discard unlanded commits |
+| GET | `/api/cards/:id/landable` | whether landing is possible right now, and why not |
 | POST | `/api/cards/:id/open` | open `changes` or `session` in Orca |
 | POST | `/api/cards/:id/snooze` | `{ "until": "7d" }` — hold the card until due |
 | POST | `/api/cards/reorder` | `{ "ids": [...] }` |
@@ -717,7 +788,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 198 tests
+npm test          # 221 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```

@@ -173,6 +173,25 @@ file, no idle check, no timeout.
 Never take a card back that you did not take over, and never assume a card sitting in
 In Progress is stuck: check `kanban status` first, which names every held card.
 
+## Finishing with the branch
+
+Approving commits on the card's own branch and stops there — nothing is published. Two
+ways a finished card ends, and picking the right one matters:
+
+- `kanban card land <id>` — merges into the base branch (`--no-ff`), then removes the
+  branch and worktree. For cards that produced **code**.
+- `kanban card drop <id>` — deletes the branch and worktree, keeps the card, its summary
+  and its trail. For cards that produced an **answer**: a "verify"/"confirm"/"check" card
+  leaves notes like `FINDINGS.md` in its worktree, and those do not belong in the
+  repository. Refused unless `--force` when the base branch lacks those commits.
+
+`kanban status` lists every Done card still carrying a branch, so nothing is forgotten.
+
+Never land on a hunch: landing is refused, with a reason, when the card is not Done, the
+repository is on another branch, the base branch is dirty, the worktree has loose files,
+or `verifyCommand` fails. Read the reason rather than retrying. There is deliberately no
+automatic merge on approve.
+
 ## Reopening an agent conversation
 
 A finished card's Orca terminal is closed, but its conversation is not gone: OMP stores

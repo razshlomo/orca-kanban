@@ -17,6 +17,11 @@ board", "queue this", "break this into cards", or asks what is on the board, use
   `yours` in `kanban status` is deliberately held — leave it alone.
 - `kanban card resume <id>` reopens a finished card's agent conversation (stored per
   worktree), so a closed terminal is not a dead end during review.
+- Approving commits on the card's own branch and publishes nothing. Finish the job with
+  `kanban card land <id>` (merge into the base branch, for code) or `kanban card drop <id>`
+  (bin the branch, keep the card and its answer — for "verify"/"confirm" cards whose
+  worktree only holds notes). `kanban status` lists Done cards still carrying a branch.
+  Landing is never automatic and refuses with a reason; read it instead of retrying.
 - A schedule needs `--state Ready`: a date on a Backlog card never fires, because
   Backlog is not picked up. `kanban card list` says why a Ready card waits.
 - Later or repeating work: `--not-before 7d` on add, `kanban card snooze <id> 1w`, or

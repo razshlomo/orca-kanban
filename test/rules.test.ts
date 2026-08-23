@@ -6,8 +6,9 @@ import path from 'node:path';
 import test from 'node:test';
 import { BoardRuleError } from '../src/board.ts';
 import { loadConfig } from '../src/config.ts';
-import { describeLanding, landCardWork } from '../src/land.ts';
+import { describeCommit, commitCardWork } from '../src/land.ts';
 import type { Card, CardState } from '../src/types.ts';
+import { parseArgs } from '../src/cli.ts';
 import { testBoard } from './helpers.ts';
 
 /** A real git repo with one commit and some unstaged agent output. */
@@ -47,9 +48,9 @@ test('approving commits the work, so Done never means "finished but nothing in t
 
 	const target = board.verdictTarget(card.id);
 	assert.ok(target);
-	const landing = await landCardWork(target, loadConfig({}));
+	const landing = await commitCardWork(target, loadConfig({}));
 
-	assert.equal(landing.committed, true, describeLanding(landing));
+	assert.equal(landing.committed, true, describeCommit(landing));
 	assert.equal(dirtyCount(repo), 0, 'the worktree is clean afterwards');
 	assert.equal(commitCount(repo), 2, 'exactly one new commit');
 
@@ -88,7 +89,7 @@ test('the commit message names the card and carries the agent summary', async ()
 		{ successState: 'Review' },
 	);
 
-	await landCardWork(board.getCard(card.id) as Card, loadConfig({}));
+	await commitCardWork(board.getCard(card.id) as Card, loadConfig({}));
 	const message = execFileSync('git', ['-C', repo, 'log', '-1', '--pretty=%B'], { encoding: 'utf8' });
 
 	assert.match(message, /add a helper/);
@@ -101,7 +102,7 @@ test('landing is skipped, not failed, when there is nothing to land', async () =
 	const config = loadConfig({});
 
 	const never = board.createCard({ title: 'never ran', state: 'Review' });
-	assert.deepEqual(await landCardWork(board.getCard(never.id) as Card, config), {
+	assert.deepEqual(await commitCardWork(board.getCard(never.id) as Card, config), {
 		committed: false,
 		reason: 'no-worktree',
 	});
@@ -110,7 +111,7 @@ test('landing is skipped, not failed, when there is nothing to land', async () =
 	execFileSync('git', ['-C', repo, 'init', '-q']);
 	const clean = board.createCard({ title: 'clean', state: 'Review' });
 	board.attachSession(clean.id, { sessionId: null, worktreeId: null, worktreePath: repo, branch: null });
-	assert.deepEqual(await landCardWork(board.getCard(clean.id) as Card, config), {
+	assert.deepEqual(await commitCardWork(board.getCard(clean.id) as Card, config), {
 		committed: false,
 		reason: 'nothing-to-commit',
 	});
@@ -122,7 +123,7 @@ test('landOnApprove off leaves the repository completely alone', async () => {
 	const card = board.createCard({ title: 'x', state: 'Review' });
 	board.attachSession(card.id, { sessionId: null, worktreeId: null, worktreePath: repo, branch: null });
 
-	const outcome = await landCardWork(board.getCard(card.id) as Card, loadConfig({ landOnApprove: 'off' }));
+	const outcome = await commitCardWork(board.getCard(card.id) as Card, loadConfig({ landOnApprove: 'off' }));
 	assert.deepEqual(outcome, { committed: false, reason: 'disabled' });
 	assert.equal(dirtyCount(repo), 2, 'nothing was committed');
 	assert.equal(commitCount(repo), 1);
@@ -197,13 +198,13 @@ test('moving a card out of In Progress is still allowed, as the escape hatch', (
 	board.close();
 });
 
-test('describeLanding reads as a sentence for every outcome', () => {
-	assert.match(describeLanding({ committed: true, sha: 'abcdef1234', files: 1 }), /committed abcdef12 \(1 file\)/);
-	assert.match(describeLanding({ committed: true, sha: 'abcdef1234', files: 3 }), /3 files/);
-	assert.match(describeLanding({ committed: false, reason: 'disabled' }), /landOnApprove is off/);
-	assert.match(describeLanding({ committed: false, reason: 'no-worktree' }), /never ran/);
-	assert.match(describeLanding({ committed: false, reason: 'nothing-to-commit' }), /already clean/);
-	assert.match(describeLanding({ committed: false, reason: 'failed', error: 'boom' }), /commit failed: boom/);
+test('describeCommit reads as a sentence for every outcome', () => {
+	assert.match(describeCommit({ committed: true, sha: 'abcdef1234', files: 1 }), /committed abcdef12 \(1 file\)/);
+	assert.match(describeCommit({ committed: true, sha: 'abcdef1234', files: 3 }), /3 files/);
+	assert.match(describeCommit({ committed: false, reason: 'disabled' }), /landOnApprove is off/);
+	assert.match(describeCommit({ committed: false, reason: 'no-worktree' }), /never ran/);
+	assert.match(describeCommit({ committed: false, reason: 'nothing-to-commit' }), /already clean/);
+	assert.match(describeCommit({ committed: false, reason: 'failed', error: 'boom' }), /commit failed: boom/);
 });
 
 test('the committed sha survives a reread, so the UI can link to it', () => {
@@ -214,4 +215,22 @@ test('the committed sha survives a reread, so the UI can link to it', () => {
 	assert.equal(board.recordCommit(card.id, 'deadbeefcafe')?.commitSha, 'deadbeefcafe');
 	assert.equal(board.getCard(card.id)?.commitSha, 'deadbeefcafe');
 	board.close();
+});
+
+test('short flags are parsed, because the usage text promises them', () => {
+	// `-m` went into the positionals while only `--` was parsed, so approving with
+	// -m "looks right" recorded no comment at all, and rejecting recorded "-m " in
+	// front of the reason. Both are silent losses of something a person typed.
+	const approve = parseArgs(['card', 'approve', 'card_1', '-m', 'looks right']);
+	assert.equal(approve.flags['m'], 'looks right');
+	assert.deepEqual(approve._, ['card', 'approve', 'card_1'], 'the message is not a positional');
+
+	// Long flags keep working, including a negative number as a value.
+	const long = parseArgs(['card', 'add', 'x', '--priority', '-5', '--force']);
+	assert.equal(long.flags['priority'], '-5', 'a negative number is a value, not a flag');
+	assert.equal(long.flags['force'], true);
+
+	// A short flag with nothing after it is a boolean, not a swallowed argument.
+	assert.equal(parseArgs(['card', 'approve', 'id', '-m']).flags['m'], true);
+	assert.equal(parseArgs(['-m', '--force']).flags['m'], true, 'a flag does not eat the next flag');
 });

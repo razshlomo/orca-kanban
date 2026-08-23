@@ -100,6 +100,8 @@ function rowToCard(row: Row): Card {
 		branch: (row['branch'] as string | null) ?? null,
 		worktreePath: (row['worktree_path'] as string | null) ?? null,
 		commitSha: (row['commit_sha'] as string | null) ?? null,
+		landedSha: (row['landed_sha'] as string | null) ?? null,
+		landedAt: row['landed_at'] === null || row['landed_at'] === undefined ? null : Number(row['landed_at']),
 		worktreeId: (row['worktree_id'] as string | null) ?? null,
 		orcaTaskId: (row['orca_task_id'] as string | null) ?? null,
 		orcaDispatchId: (row['orca_dispatch_id'] as string | null) ?? null,
@@ -510,6 +512,83 @@ export class Board extends EventEmitter {
 	/** Cards a human is holding right now, board-wide. */
 	manualCards(): Card[] {
 		return (this.db.prepare('SELECT * FROM cards WHERE manual_since IS NOT NULL').all() as Row[]).map(rowToCard);
+	}
+
+	/**
+	 * Records that a card's branch is now in the base branch.
+	 *
+	 * The card does not move: it is already Done, and landing is about the repository
+	 * rather than the board. What changes is that the work is published, which is why
+	 * it gets its own field instead of overwriting `commitSha`.
+	 */
+	recordLanding(id: string, mergeSha: string, base: string, disposed: boolean): Card | null {
+		const card = this.getCard(id);
+		if (!card) return null;
+
+		const now = Date.now();
+		this.db.prepare('UPDATE cards SET landed_sha = ?, landed_at = ?, updated_at = ? WHERE id = ?').run(mergeSha, now, now, id);
+		if (disposed) this.clearWorktree(id);
+		this.addComment(
+			id,
+			`Landed on ${base} as ${mergeSha.slice(0, 8)}${disposed ? '; branch and worktree removed.' : '.'}`,
+			{ author: 'board' },
+		);
+		this.recordEvent('card_landed', { cardId: id, data: { mergeSha, base, disposed } });
+		this.touched('card_landed', id);
+		return this.getCard(id);
+	}
+
+	/**
+	 * Whether a card's branch may be thrown away at all.
+	 *
+	 * Public because dropping deletes a directory before the board is told, so the
+	 * refusal has to be available BEFORE the work happens — discovering it afterwards
+	 * would mean a worktree removed and a rule broken.
+	 */
+	assertDroppable(card: Card): void {
+		this.refuseWhileRunning(card, 'drop the branch of a card');
+		if (card.manualSince !== null) {
+			throw new BoardRuleError(
+				`Cannot drop ${card.id}: you are holding this card by hand. Take it back first.`,
+				card.id,
+				card.state,
+			);
+		}
+	}
+
+	/**
+	 * Records that a card's branch and worktree have been thrown away.
+	 *
+	 * The card, its summary and its trail stay: for the many cards whose deliverable is
+	 * an answer rather than code, that IS the result, and the branch was only ever
+	 * scratch space.
+	 */
+	recordDrop(id: string, detail: string): Card | null {
+		const card = this.getCard(id);
+		if (!card) return null;
+		this.assertDroppable(card);
+
+		this.clearWorktree(id);
+		this.addComment(id, detail, { author: 'board' });
+		this.recordEvent('card_dropped', { cardId: id, data: { detail } });
+		this.touched('card_dropped', id);
+		return this.getCard(id);
+	}
+
+	/** Forgets a card's git working state, once it genuinely no longer exists. */
+	private clearWorktree(id: string): void {
+		this.db
+			.prepare('UPDATE cards SET worktree_path = NULL, worktree_id = NULL, branch = NULL, updated_at = ? WHERE id = ?')
+			.run(Date.now(), id);
+	}
+
+	/** Done cards still carrying a branch — the work waiting to be landed or dropped. */
+	unlandedCards(): Card[] {
+		return (
+			this.db
+				.prepare("SELECT * FROM cards WHERE state = 'Done' AND landed_sha IS NULL AND (branch IS NOT NULL OR worktree_path IS NOT NULL)")
+				.all() as Row[]
+		).map(rowToCard);
 	}
 
 	/**

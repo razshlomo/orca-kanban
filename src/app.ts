@@ -4,6 +4,14 @@ import { openDb } from './db.ts';
 import { createOrcaExecutor } from './executor.ts';
 import { createLogger, type Logger } from './logger.ts';
 import { commentForCard, mirrorCardToOrca } from './mirror.ts';
+import {
+	describeDrop,
+	describeLanding,
+	dropCardBranch,
+	landCard,
+	type DropOutcome,
+	type LandOutcome,
+} from './land.ts';
 import { OrcaCli, type OrcaApi } from './orca.ts';
 import { disabledOrchestration, OrcaOrchestration, type OrchestrationApi } from './orchestration.ts';
 import { recoverStrandedCards, type RecoveryReport } from './recovery.ts';
@@ -29,6 +37,16 @@ export type App = {
 	 * card in the gap and close the terminal being claimed.
 	 */
 	takeOver: (id: string) => Promise<Card>;
+	/**
+	 * Merges a Done card's branch into the base branch. Refuses rather than forces:
+	 * every reason it can decline is a sentence the caller can show.
+	 */
+	land: (id: string, options?: { keepBranch?: boolean }) => Promise<{ card: Card; outcome: LandOutcome }>;
+	/**
+	 * Throws away a card's branch and worktree, keeping the card and its trail. This is
+	 * how a card whose deliverable was an answer rather than code ends.
+	 */
+	drop: (id: string, options?: { force?: boolean }) => Promise<{ card: Card; outcome: DropOutcome }>;
 	close: () => void;
 };
 
@@ -68,6 +86,13 @@ export function createApp(
 
 	const mirror = async (card: Card, state: CardState, comment?: string): Promise<void> => {
 		await mirrorCardToOrca({ orca, config, log, card, state, comment: commentForCard(card, comment) });
+	};
+
+	// Orca created the worktree and keeps its own registry, so removal goes through Orca
+	// rather than `git worktree remove` — otherwise its board keeps a card for a
+	// directory that no longer exists.
+	const removeWorktree = async (worktreePath: string): Promise<void> => {
+		await orca.worktreeRemove(`path:${worktreePath}`);
 	};
 
 	const scheduler = new Scheduler({
@@ -113,6 +138,33 @@ export function createApp(
 				}
 			}
 			return card;
+		},
+		land: async (id, options = {}) => {
+			const card = board.getCard(id);
+			if (!card) throw new Error(`no such card ${id}`);
+
+			const outcome = await landCard(card, config, { removeWorktree }, options);
+			if (!outcome.landed) return { card, outcome };
+
+			const landed = board.recordLanding(id, outcome.sha, outcome.plan.base, outcome.disposed) ?? card;
+			log.info('landed a card', { cardId: id, detail: describeLanding(outcome) });
+			await mirror(landed, landed.state, `Landed on ${outcome.plan.base} as ${outcome.sha.slice(0, 8)}.`);
+			return { card: landed, outcome };
+		},
+		drop: async (id, options = {}) => {
+			const card = board.getCard(id);
+			if (!card) throw new Error(`no such card ${id}`);
+
+			// Ask the board first: it owns the rules about which cards may be touched at
+			// all, and refusing after deleting a worktree would be too late.
+			board.assertDroppable(card);
+
+			const outcome = await dropCardBranch(card, config, { removeWorktree }, options);
+			if (!outcome.dropped) return { card, outcome };
+
+			const dropped = board.recordDrop(id, `Branch and worktree dropped — ${describeDrop(outcome)}.`) ?? card;
+			log.info('dropped a card branch', { cardId: id, detail: describeDrop(outcome) });
+			return { card: dropped, outcome };
 		},
 		close: () => board.close(),
 	};

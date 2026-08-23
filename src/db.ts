@@ -167,6 +167,16 @@ const MIGRATIONS: string[] = [
 	   refused, and the slot stays held because the lane is occupied by you. */
 	ALTER TABLE cards ADD COLUMN manual_since INTEGER;
 	`,
+	`
+	/* The merge commit that landed this card's branch on the base branch, and when.
+
+	   Separate from commit_sha on purpose: that one says the work exists on a branch of
+	   its own, this one says it has been published where others build from. Landing is a
+	   deliberate human step, never a consequence of a card reaching Done, so most cards
+	   keep these null for good — their deliverable was an answer, not code. */
+	ALTER TABLE cards ADD COLUMN landed_sha TEXT;
+	ALTER TABLE cards ADD COLUMN landed_at INTEGER;
+	`,
 ];
 
 /**

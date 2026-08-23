@@ -132,6 +132,10 @@
 			.runs div { border-bottom: 1px solid var(--border); padding: 5px 0; }
 			.hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
 			.hint.warn { color: var(--warn); }
+			.hint.ok { color: var(--ok); }
+			/* Landing changes a branch other people read, so it is fenced off from the
+			   card's own actions rather than sitting in the same row as them. */
+			.landing { margin-top: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: #0d1117; }
 			/* What the agent wrote, treated as prose rather than machine output: body font,
 			   generous line-height, real bullets, and a tall cap so a summary is readable in
 			   place instead of through a 220px monospace slot. */
@@ -275,6 +279,8 @@
 			// The panel re-renders on every poll, so a fetched diff is cached here or it
 			// would vanish a second after you asked for it.
 			let diffCache = { cardId: null, text: '' };
+			/** The server's answer about whether one card may be landed right now. */
+			let landCache = { cardId: null, probe: null };
 
 			function render() {
 				const s = snapshot.scheduler || {};
@@ -514,6 +520,11 @@
 					// the watch will re-attach to.
 					takeOver: running && !mine && Boolean(c.sessionId),
 					takeBack: mine && Boolean(c.worktreePath),
+					// Landing needs the repository checked and clean, which only the server can
+					// see, so the button starts from what the card shows and the probe below
+					// replaces the reason with the real one.
+					land: c.state === 'Done' && !mine && Boolean(c.branch) && Boolean(c.commitSha) && !c.landedSha,
+					drop: !running && !mine && (Boolean(c.branch) || Boolean(c.worktreePath)),
 				};
 				const why = {
 					retry: running ? 'Stop the card first' : 'Nothing has been attempted yet',
@@ -530,9 +541,36 @@
 							? `Only a running card has a live session to take — this one is in ${c.state}`
 							: 'This card has no live session',
 					takeBack: 'The board is already watching this card',
+					land: c.landedSha
+						? `Already landed as ${String(c.landedSha).slice(0, 8)}`
+						: mine
+							? 'You are holding this card by hand — take it back first'
+							: c.state !== 'Done'
+								? `Only an approved card can be landed — this one is in ${c.state}`
+								: !c.branch
+									? 'This card has no branch (it never ran)'
+									: 'Nothing was committed on this card, so there is nothing to land',
+					drop: running
+						? 'Stop the card first'
+						: mine
+							? 'You are holding this card by hand — take it back first'
+							: 'This card has no branch or worktree to drop',
 				};
 				try { runs = (await api(`/api/cards/${encodeURIComponent(c.id)}/runs`)).runs; } catch {}
 				try { comments = (await api(`/api/cards/${encodeURIComponent(c.id)}/comments`)).comments; } catch {}
+
+				// Whether the REPOSITORY allows this landing — the base branch checked out and
+				// clean, the branch still ahead. Asked once per card and cached, because the
+				// answer needs git and the panel redraws whenever anything changes.
+				if (can.land && landCache.cardId !== c.id) {
+					landCache = { cardId: c.id, probe: null };
+					try { landCache.probe = await api(`/api/cards/${encodeURIComponent(c.id)}/landable`); } catch {}
+				}
+				const probe = landCache.cardId === c.id ? landCache.probe : null;
+				if (probe && !probe.can) {
+					can.land = false;
+					why.land = probe.why || why.land;
+				}
 
 				// Open what this card's state is actually about, unless the user chose.
 				const open = (name, fallback) => (openGroups[name] ?? fallback) ? 'open' : '';
@@ -641,6 +679,21 @@
 							</div>
 							${diffCache.cardId === c.id ? `<pre data-scroll="diff" style="max-height:300px;color:var(--text)">${esc(diffCache.text)}</pre>` : ''}
 							${c.commitSha ? `<div class="hint">Committed as <code>${esc(c.commitSha.slice(0, 8))}</code>.</div>` : can.openChanges ? '<div class="hint warn">Not committed — approving commits it on this card\u2019s branch.</div>' : ''}
+							${c.landedSha ? `<div class="hint ok">Landed on ${esc(probe?.base || 'the base branch')} as <code>${esc(c.landedSha.slice(0, 8))}</code>.</div>` : ''}
+							${(c.state === 'Done' || c.landedSha) && (c.branch || c.worktreePath) ? `
+								<div class="landing">
+									<div class="hint">
+										${c.landedSha
+											? 'This work is published. The branch can go now.'
+											: probe && probe.can
+												? `Ready to merge into <code>${esc(probe.base)}</code>${probe.behind ? ` — ${probe.behind} commit${probe.behind === 1 ? '' : 's'} behind it` : ''}${probe.verifyCommand ? `, after <code>${esc(probe.verifyCommand)}</code> passes` : ''}.`
+												: 'Approving committed this on the card\u2019s own branch. Landing it into the base branch is a separate, deliberate step.'}
+									</div>
+									<div class="actions" style="margin-top:6px">
+										<button class="ok" ${can.land ? '' : `disabled title="${esc(why.land)}"`} onclick="landCard()">Land → ${esc(probe?.base || 'base')}</button>
+										<button ${can.drop ? '' : `disabled title="${esc(why.drop)}"`} onclick="dropCard()">Drop branch</button>
+									</div>
+								</div>` : ''}
 							${can.verdict ? `
 								<label for="f-comment">Your verdict</label>
 								<textarea id="f-comment" placeholder="Required to request changes — the next agent reads it"></textarea>
@@ -870,6 +923,55 @@
 				baseline = null;
 				await refresh();
 				reportSave('The board is watching this session again', 'ok');
+			}
+
+			/**
+			 * Merges this card's branch into the base branch. This is the only button here
+			 * that changes something other people read, so it says what it did — which sha,
+			 * on which branch — rather than a bare "done".
+			 */
+			async function landCard() {
+				const id = selectedId;
+				renderFooter('Landing\u2026');
+				let out;
+				try {
+					out = await api(`/api/cards/${encodeURIComponent(id)}/land`, 'POST', {});
+				} catch (e) {
+					// A refusal is the useful case: it names what has to change first.
+					landCache = { cardId: null, probe: null };
+					await refresh();
+					return reportSave(e.message, 'bad');
+				}
+				landCache = { cardId: null, probe: null };
+				baseline = null;
+				lastBody = null;
+				await refresh();
+				reportSave(out.detail || 'Landed', 'ok');
+			}
+
+			/** Throws the branch away, keeping the card and everything written about it. */
+			async function dropCard() {
+				const id = selectedId;
+				renderFooter('Dropping\u2026');
+				try {
+					await api(`/api/cards/${encodeURIComponent(id)}/drop`, 'POST', {});
+				} catch (e) {
+					// Unlanded commits are refused once, then confirmed: the second attempt is
+					// the one that admits work is being thrown away.
+					if (!/unlanded|does not/.test(e.message) || !confirm(`${e.message}\n\nDiscard them anyway?`)) {
+						return reportSave(e.message, 'bad');
+					}
+					try {
+						await api(`/api/cards/${encodeURIComponent(id)}/drop`, 'POST', { force: true });
+					} catch (e2) {
+						return reportSave(e2.message, 'bad');
+					}
+				}
+				landCache = { cardId: null, probe: null };
+				baseline = null;
+				lastBody = null;
+				await refresh();
+				reportSave('Branch dropped — the card and its trail stay', 'ok');
 			}
 
 			async function retryCard() {
