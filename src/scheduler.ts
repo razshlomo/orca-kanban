@@ -52,6 +52,7 @@ export class Scheduler extends EventEmitter {
 	private running = false;
 	private stopAfterCurrentFlag = false;
 	private loopPromise: Promise<void> | null = null;
+	private heartbeat: NodeJS.Timeout | undefined = undefined;
 	private wake: (() => void) | null = null;
 	private readonly inFlight = new Map<string, InFlight>();
 
@@ -111,6 +112,21 @@ export class Scheduler extends EventEmitter {
 			ownerPid: process.pid,
 			heartbeatAt: Date.now(),
 		});
+
+		// On its own timer, NOT at the top of the loop.
+		//
+		// The loop parks inside `await …settled` for as long as a card runs — up to
+		// `cardTimeoutMs` — so a loop-driven heartbeat goes stale exactly while a card IS
+		// being watched. `kanban status` and the UI then say "not running" at the one
+		// moment the board is busiest, and `assertSchedulerFree` would wave a second
+		// scheduler through onto the same agent sessions.
+		this.heartbeat = setInterval(
+			() => this.board.patchSchedulerState({ heartbeatAt: Date.now(), ownerPid: process.pid }),
+			Math.min(this.config.pollIntervalMs, 5000),
+		);
+		// Never hold the process open for a heartbeat alone.
+		this.heartbeat.unref?.();
+
 		this.loopPromise = this.loop();
 	}
 
@@ -152,6 +168,10 @@ export class Scheduler extends EventEmitter {
 	/** Stops the loop entirely and waits for every in-flight card to settle. */
 	async stop(options: { abortCurrent?: boolean } = {}): Promise<void> {
 		this.running = false;
+		// Before the awaits: a stopping scheduler must stop claiming to be alive, or a
+		// replacement started during the drain is refused by the singleton check.
+		clearInterval(this.heartbeat);
+		this.heartbeat = undefined;
 		if (options.abortCurrent) for (const flight of this.inFlight.values()) flight.abort.abort();
 		this.wakeUp();
 		await this.loopPromise?.catch(() => {});

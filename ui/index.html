@@ -497,14 +497,21 @@
 			 * The verdict box is deliberately NOT in FIELDS — Save does not persist it, so
 			 * marking the form dirty from it would promise something Save will not do. That
 			 * left it outside the only thing guarding against a redraw, so every poll ate
-			 * what was being typed. Focus counts too: a cursor sitting in the panel is a
-			 * person mid-thought, and moving the ground under them is its own bug.
+			 * what was being typed.
+			 *
+			 * Focus counts only for things you TYPE into. A focused button is a finished
+			 * click, and treating it as work-in-progress is what produced "I clicked Take
+			 * over and nothing happened": the clicked button kept focus, every poll after it
+			 * skipped the redraw, and the panel could not repaint into its new state until
+			 * the card was closed and reopened.
 			 */
 			function hasPendingInput() {
 				const note = document.getElementById('f-comment');
 				if (note && note.value !== '') return true;
 				const here = document.activeElement;
-				return Boolean(here && here !== document.body && document.getElementById('panelBody')?.contains(here));
+				if (!here || here === document.body) return false;
+				if (!document.getElementById('panelBody')?.contains(here)) return false;
+				return /^(INPUT|TEXTAREA|SELECT)$/.test(here.tagName) || here.isContentEditable === true;
 			}
 
 			/**
@@ -950,6 +957,11 @@
 					return reportSave(e.message, 'bad');
 				}
 				baseline = null;
+				// Both of these swap one whole section of the panel for another — the section
+				// carrying the button just clicked. Force the rebuild rather than leaving it to
+				// the poll's redraw guard, which is the difference between seeing the new state
+				// and having to close and reopen the card.
+				lastBody = null;
 				await refresh();
 				reportSave('Yours \u2014 the board has stopped watching', 'ok');
 			}
@@ -962,6 +974,7 @@
 					return reportSave(e.message, 'bad');
 				}
 				baseline = null;
+				lastBody = null;
 				await refresh();
 				reportSave('The board is watching this session again', 'ok');
 			}

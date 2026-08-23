@@ -139,6 +139,24 @@ test('a poll never redraws over text a person is still typing', () => {
 	assert.match(bodyOf, /contains\(here\)/, 'a cursor inside the panel must hold it off too');
 });
 
+test('a finished click never freezes the panel', () => {
+	// The gate blocks a redraw while somebody is typing. A focused BUTTON is not
+	// typing: it is a click that already happened, and holding the redraw off for it
+	// left the panel showing the state before the click — "I pressed Take over and
+	// nothing happened", fixed only by closing and reopening the card.
+	const pending = script.slice(script.indexOf('function hasPendingInput()'));
+	const bodyOf = pending.slice(0, pending.indexOf('\n\t\t\t}'));
+	assert.match(bodyOf, /INPUT\|TEXTAREA\|SELECT/, 'only text entry may hold off the redraw');
+	assert.match(bodyOf, /isContentEditable/);
+
+	// Take over / take back each swap the section carrying the button just clicked,
+	// so they must invalidate the tracked markup like every other state change.
+	for (const fn of ['takeOver', 'takeBack']) {
+		const body = script.slice(script.indexOf(`async function ${fn}(`));
+		assert.match(body.slice(0, body.indexOf('\n\t\t\t}')), /lastBody = null;/, `${fn} must invalidate the tracked markup`);
+	}
+});
+
 test('a redraw that must happen carries unsent text, but never onto another card', () => {
 	const block = script.slice(script.indexOf('const same = lastBodyCard === c.id;'), script.indexOf('details.group'));
 	assert.match(block, /const note = same \? bodyEl\.querySelector\('#f-comment'\) : null;/);

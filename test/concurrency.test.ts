@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import test from 'node:test';
-import { Board } from '../src/board.ts';
+import { setImmediate as tick } from 'node:timers/promises';
+import { Board, schedulerLiveness } from '../src/board.ts';
 import { loadConfig } from '../src/config.ts';
 import { openDb } from '../src/db.ts';
 import { Scheduler } from '../src/scheduler.ts';
@@ -138,6 +139,40 @@ test('maxConcurrent 1 keeps execution strictly sequential', async () => {
 	assert.equal(gate.peak, 1, 'the default behaviour is unchanged');
 	gate.releaseAll();
 	await scheduler.stop();
+	board.close();
+});
+
+test('a busy scheduler still reports itself alive', async () => {
+	const { board } = testBoard();
+	board.createCard({ title: 'a', state: 'Ready' });
+
+	const gate = gatedExecutor();
+	const config = testConfig({ maxConcurrent: 1, pollIntervalMs: 100 });
+	const scheduler = new Scheduler({ board, config, executor: gate.executor, log: silentLogger });
+
+	scheduler.start({ autoRun: true });
+	await gate.waitForStart(1);
+
+	// The loop parks inside the await for as long as the card runs, so a heartbeat
+	// written at the top of the loop goes stale exactly while the board is busiest —
+	// reporting "not running" with a card in flight, and letting the singleton check
+	// wave a second scheduler onto the same session.
+	const parked = board.schedulerStatus().heartbeatAt as number;
+	const deadline = Date.now() + 3000;
+	while (board.schedulerStatus().heartbeatAt === parked) {
+		assert.ok(Date.now() < deadline, 'the heartbeat stopped while a card was in flight');
+		await tick();
+	}
+
+	const status = board.schedulerStatus();
+	assert.equal(status.inFlight.length, 1, 'still executing');
+	assert.equal(schedulerLiveness(status, config.pollIntervalMs).alive, true);
+
+	gate.releaseAll();
+	await scheduler.stop();
+
+	// And a stopped scheduler stops claiming the board, so a replacement can start.
+	assert.equal(schedulerLiveness(board.schedulerStatus(), config.pollIntervalMs, Date.now() + 60_000).alive, false);
 	board.close();
 });
 
