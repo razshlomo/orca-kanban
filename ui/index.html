@@ -358,9 +358,10 @@
 					});
 					board.appendChild(col);
 				}
-				// Never redraw over unsaved edits: the old focus/blur guard dropped them the
-				// moment you clicked away, which silently lost typing every 1.5 seconds.
-				if (selectedId && !isDirty() && !saving) renderPanel();
+				// Never redraw over work in progress: the old focus/blur guard dropped edits the
+				// moment you clicked away, and the dirty check alone still ate anything typed
+				// into the verdict box, which Save does not own.
+				if (selectedId && !isDirty() && !hasPendingInput() && !saving) renderPanel();
 			}
 
 			function cardEl(c) {
@@ -403,6 +404,20 @@
 			/** The values the panel was rendered with, to compare against for unsaved edits. */
 			let baseline = null;
 
+			/**
+			 * The markup the body was last built from, and the card it described.
+			 *
+			 * This cannot be read back off the DOM. The browser rewrites what it parses —
+			 * `open` becomes `open=""`, `<input />` loses the slash, `<option selected>` gains
+			 * `=""` — so comparing a template string against `innerHTML` NEVER matched, and
+			 * the body was in fact torn down and rebuilt on every 1.5s poll. Scroll position
+			 * survived only because it is explicitly saved and restored below, which hid the
+			 * dead comparison. Anything not restored by hand — text typed into the verdict
+			 * box, the caret, focus — was destroyed twice a second.
+			 */
+			let lastBody = null;
+			let lastBodyCard = null;
+
 			/** The editable fields, in one list, so save/revert/dirty all agree on the set. */
 			const FIELDS = [
 				['f-title', 'title'],
@@ -430,6 +445,22 @@
 				const now = formValues();
 				return FIELDS.some(([id]) => now[id] !== baseline[id]);
 			};
+
+			/**
+			 * Work in the panel that no button owns yet.
+			 *
+			 * The verdict box is deliberately NOT in FIELDS — Save does not persist it, so
+			 * marking the form dirty from it would promise something Save will not do. That
+			 * left it outside the only thing guarding against a redraw, so every poll ate
+			 * what was being typed. Focus counts too: a cursor sitting in the panel is a
+			 * person mid-thought, and moving the ground under them is its own bug.
+			 */
+			function hasPendingInput() {
+				const note = document.getElementById('f-comment');
+				if (note && note.value !== '') return true;
+				const here = document.activeElement;
+				return Boolean(here && here !== document.body && document.getElementById('panelBody')?.contains(here));
+			}
 
 			/**
 			 * The footer is the only place that talks about saving, and it always describes
@@ -647,19 +678,43 @@
 
 				const headEl = document.getElementById('panelHead');
 				const bodyEl = document.getElementById('panelBody');
-				if (headEl.innerHTML !== nextHead) headEl.innerHTML = nextHead;
+				// The head holds no inputs and carries a ticking age, so it is rewritten every
+				// poll on purpose. It had the same comparison as the body, which was equally
+				// dead — keeping it would only suggest a saving that never happened.
+				headEl.innerHTML = nextHead;
 
-				// Only touch the body when the markup genuinely differs. Rewriting it on every
-				// 1.5s poll destroyed and rebuilt every child, which threw away the scroll
-				// position inside the agent summary — so reading anything long was impossible.
-				if (bodyEl.innerHTML !== nextBody) {
-					// A redraw that IS needed must not lose the reader's place either.
+				// Only touch the body when the markup genuinely changed, compared against what
+				// we last built rather than against the DOM's own rewriting of it.
+				if (lastBody !== nextBody || lastBodyCard !== c.id) {
+					// A redraw that IS needed must not lose the reader's place, and must not
+					// swallow half-written text. Both are only worth carrying over when the
+					// panel still describes the same card — a note belongs to the card it was
+					// typed on, never to the next one clicked.
+					const same = lastBodyCard === c.id;
 					const scrolls = [...bodyEl.querySelectorAll('[data-scroll]')].map((e) => [e.dataset.scroll, e.scrollTop]);
+					const note = same ? bodyEl.querySelector('#f-comment') : null;
+					const typed = note && note.value !== ''
+						? { value: note.value, start: note.selectionStart, end: note.selectionEnd, focused: document.activeElement === note }
+						: null;
+
 					bodyEl.innerHTML = nextBody;
+					lastBody = nextBody;
+					lastBodyCard = c.id;
 
 					for (const [key, top] of scrolls) {
 						const el = bodyEl.querySelector(`[data-scroll="${key}"]`);
 						if (el) el.scrollTop = top;
+					}
+
+					if (typed) {
+						const next = bodyEl.querySelector('#f-comment');
+						if (next) {
+							next.value = typed.value;
+							if (typed.focused) {
+								next.focus();
+								next.setSelectionRange(typed.start, typed.end);
+							}
+						}
 					}
 
 					// Remember only what the USER opened. Chrome queues a `toggle` event for a
@@ -702,6 +757,7 @@
 				if (isDirty() && !confirm('Discard the unsaved changes on this card?')) return;
 				selectedId = null;
 				baseline = null;
+				lastBody = null;
 				lastSaveMsg = null;
 				document.getElementById('panel').classList.add('hidden');
 			}
@@ -768,10 +824,10 @@
 				if (!isDirty()) return;
 				lastSaveMsg = null;
 				baseline = null;
-				// Typing changes an input’s value PROPERTY, not its attribute, so the markup
-				// comparison in renderPanel cannot see the edits. Emptying the body forces the
-				// rewrite that actually discards them.
-				document.getElementById("panelBody").innerHTML = "";
+				// Typing changes an input's value PROPERTY, not its attribute, so the rebuilt
+				// markup is identical to what is already on screen and the guard would skip it.
+				// Forgetting the last markup is what forces the rewrite that discards the edits.
+				lastBody = null;
 				renderPanel();
 			}
 
@@ -850,8 +906,14 @@
 				} catch (e) {
 					return reportSave(e.message, 'bad');
 				}
+				// The note has been filed, so the box must be emptied here. Nothing else does
+				// it: the redraw now carries unsent text ACROSS a rebuild, so leaving the value
+				// in place would restore what was just sent and keep the panel from refreshing.
+				const note = document.getElementById('f-comment');
+				if (note) note.value = '';
 				// The verdict moved the card, so the panel must redraw from the board.
 				baseline = null;
+				lastBody = null;
 				lastSaveMsg = { text: done, tone: 'ok' };
 				await refresh();
 				reportSave(done, 'ok');

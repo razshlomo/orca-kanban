@@ -170,8 +170,15 @@ test('the summary is styled as text, not as a machine-output block', () => {
 test('the panel only touches the DOM when the markup actually changed', () => {
 	// Rewriting innerHTML on every 1.5s poll destroyed every child, which threw away the
 	// scroll position inside the agent summary — the reported "scroll doesn't work".
-	assert.match(script, /if \(bodyEl\.innerHTML !== nextBody\)/);
-	assert.match(script, /if \(headEl\.innerHTML !== nextHead\)/);
+	//
+	// This originally asserted `bodyEl.innerHTML !== nextBody`, which was the fix as
+	// written but not as executed: the browser hands back its own serialisation (`open`
+	// as `open=""`, `<input />` without the slash), so that comparison was true on every
+	// poll and the body was still rebuilt twice a second. Scroll survived only because
+	// the block below restores it by hand, which hid the dead guard until typing into
+	// the verdict box vanished. The comparison must be against markup WE built.
+	assert.match(script, /if \(lastBody !== nextBody \|\| lastBodyCard !== c\.id\)/);
+	assert.doesNotMatch(script, /innerHTML !== next/, 'never compare against the parsed DOM');
 });
 
 test('a redraw that is needed restores the reader scroll position', () => {
@@ -185,9 +192,11 @@ test('a redraw that is needed restores the reader scroll position', () => {
 
 test('revert forces a redraw, because typing does not change the markup', () => {
 	// An input's value PROPERTY changes on typing while its attribute does not, so the
-	// innerHTML comparison cannot see edits and would skip the discard.
-	const revert = script.slice(script.indexOf('function revertCard'), script.indexOf('async function retryCard'));
-	assert.match(revert, /panelBody"\)\.innerHTML = ""/);
+	// rebuilt markup is identical to what is on screen and the guard would skip the
+	// discard. Emptying the body used to be what forced it; now that the guard trusts
+	// its own record of the markup, forgetting that record is what forces it.
+	const revert = script.slice(script.indexOf('function revertCard'), script.indexOf('async function resumeSession'));
+	assert.match(revert, /lastBody = null;/);
 });
 
 // ---------------------------------------------------------------- finding 5

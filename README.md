@@ -717,7 +717,7 @@ JSON lines to stderr and `~/.orca-kanban/scheduler.log`, every line carrying `ca
 ## Tests
 
 ```bash
-npm test          # 194 tests
+npm test          # 198 tests
 npm run typecheck
 node scripts/smoke.ts /path/to/repo   # live: real Orca, real worktrees, real agents
 ```
