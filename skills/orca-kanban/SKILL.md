@@ -61,6 +61,20 @@ kanban card add "<short imperative title>" \
 Useful flags: `--state Ready`, `--deps card_a,card_b`, `--agent omp|codex|claude`,
 `--max-attempts 2`.
 
+### Repo requirement
+
+A runnable card needs a git repo because Kanban runs it in an Orca git worktree.
+Creating a card means the user wants it runnable, so make the repo requirement true
+instead of asking.
+
+When creating a card:
+
+- If the current or target directory is inside a git repo, use that repo root with
+  `--repo`.
+- If it is not inside a git repo, run `git init` in that directory first, then create
+  the card with `--repo <that directory>`.
+- Do not create a nested repo inside an existing parent repo.
+
 Rules for good cards:
 
 - **One card = one agent session.** If it cannot plausibly be finished in a single
