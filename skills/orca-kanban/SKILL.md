@@ -63,9 +63,9 @@ Useful flags: `--state Ready`, `--deps card_a,card_b`, `--agent omp|codex|claude
 
 ### Which model a card runs on
 
-Cards carry a model **name**, not a version — `opus`, `sonnet`, `haiku`, `fable`,
-`sol`. The name is resolved to the newest matching model when the card runs, so it
-keeps working as versions change. A new card gets the configured default (Opus)
+Cards carry a model **name**, not a version — `opus` (default), `sonnet`, `haiku`,
+`fable`, `sol` and `astra`. The name resolves to the newest matching model when the
+card runs, so it keeps working as versions change. A new card gets the default
 automatically; pass `--model` only when the user asks for a specific one, and
 `--model none` when they want the agent's own default.
 
