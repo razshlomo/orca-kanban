@@ -34,3 +34,25 @@ export function buildFallbackCommand(agent: AgentConfig, vars: PromptVars): stri
 		.replaceAll('{{promptFileRel}}', shellQuote(`@${vars.promptFileRel}`))
 		.replaceAll('{{prompt}}', shellQuote(vars.prompt));
 }
+
+/**
+ * Builds the launch command for a card that names a model.
+ *
+ * This is not a fallback: it is the only way a model can be delivered, because
+ * `orca worktree create` accepts `--agent` and `--prompt` and has no model option at
+ * all. Orca still tracks an agent started this way — `worktree ps` reports
+ * `agents[].state` for any terminal running a known agent — so the completion watch,
+ * the take-over detection and the final message all keep working.
+ *
+ * `{{model}}` receives the resolved selector (`anthropic/claude-opus-5`), never the
+ * alias the card stores, so what runs is exactly what `kanban models` showed.
+ */
+export function buildModelCommand(agent: AgentConfig, vars: PromptVars & { model: string }): string | null {
+	if (!agent.modelCommand) return null;
+
+	return agent.modelCommand
+		.replaceAll('{{model}}', shellQuote(vars.model))
+		.replaceAll('{{promptFile}}', shellQuote(vars.promptFile))
+		.replaceAll('{{promptFileRel}}', shellQuote(`@${vars.promptFileRel}`))
+		.replaceAll('{{prompt}}', shellQuote(vars.prompt));
+}

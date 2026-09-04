@@ -20,6 +20,7 @@ function card(over: Partial<Card> = {}): Card {
 		dependencies: [],
 		repo: '/tmp/repo',
 		agent: null,
+		model: null,
 		createdAt: now,
 		updatedAt: now,
 		stateChangedAt: now,
@@ -105,6 +106,88 @@ test('the card is launched agent-first: one Orca call creates worktree, session,
 	assert.equal(result.branch, 'fake');
 	assert.deepEqual(result.filesChanged, ['helper.js']);
 	assert.equal(c.sessions.length, 1, 'the session was reported once so the board can persist it');
+});
+
+test('a card with a model is launched on that model, and Orca is not asked to start the agent', async () => {
+	testEnv();
+	const worktree = fakeWorktree();
+	const orca = fakeOrca({
+		worktreePath: worktree,
+		psFrames: [[worktreeRow({ worktreeId: `repo::${worktree}`, path: worktree, agents: [agentRow('done')] })]],
+	});
+
+	const execute = createOrcaExecutor({
+		orca,
+		config: testConfig(),
+		orchestration: fakeOrchestration,
+		lookupCard: () => null,
+		resolveModel: async (agentName, model) => {
+			assert.equal(agentName, 'omp');
+			assert.equal(model, 'opus', 'the alias off the card is what gets resolved');
+			return { ok: true, selector: 'anthropic/claude-opus-5' };
+		},
+	});
+
+	writeResult(worktree, 'run_model', { status: 'DONE', summary: 'built it' });
+	const result = await execute(card({ model: 'opus' }), ctx('run_model').value);
+
+	const createCall = orca.calls.find((call) => call.startsWith('worktreeCreate:'));
+	// Orca's own launch cannot carry a model, so it must not be used for this card.
+	assert.match(String(createCall), /agent=none/, 'Orca is not asked to launch the agent');
+	assert.match(String(createCall), /prompt=no/, 'and not asked to deliver the prompt either');
+
+	const terminal = orca.calls.find((call) => call.startsWith('terminalCreate:'));
+	assert.match(String(terminal), /--model anthropic\/claude-opus-5/, 'the resolved model reaches the CLI');
+	assert.match(String(terminal), /@\.orca-kanban\/prompt-run_model\.md/, 'and so does the prompt');
+
+	assert.equal(result.status, 'DONE', 'completion still comes from Orca agent state + result file');
+	assert.equal(result.model, 'opus');
+	assert.equal(result.modelSelector, 'anthropic/claude-opus-5', 'the run records the version that ran');
+});
+
+test('a model that cannot be resolved blocks the card before anything is created', async () => {
+	testEnv();
+	const orca = fakeOrca({ worktreePath: fakeWorktree() });
+
+	const execute = createOrcaExecutor({
+		orca,
+		config: testConfig(),
+		orchestration: fakeOrchestration,
+		lookupCard: () => null,
+		resolveModel: async () => ({ ok: false, reason: '"astra" matches no model in omp\'s catalog' }),
+	});
+
+	const result = await execute(card({ model: 'astra' }), ctx('run_bad_model').value);
+
+	assert.equal(result.status, 'BLOCKED', 'a wrong model is a refusal, never a 45-minute timeout');
+	assert.match(String(result.error), /matches no model/);
+	assert.equal(
+		orca.calls.find((call) => call.startsWith('worktreeCreate:')),
+		undefined,
+		'no worktree, no branch, no terminal: nothing to clean up',
+	);
+});
+
+test('an agent with no model command cannot be launched on a model', async () => {
+	testEnv();
+	const worktree = fakeWorktree();
+	const orca = fakeOrca({
+		worktreePath: worktree,
+		psFrames: [[worktreeRow({ worktreeId: `repo::${worktree}`, path: worktree, agents: [agentRow('done')] })]],
+	});
+
+	const execute = createOrcaExecutor({
+		orca,
+		config: testConfig(),
+		orchestration: fakeOrchestration,
+		lookupCard: () => null,
+		resolveModel: async () => ({ ok: true, selector: 'anthropic/claude-opus-5' }),
+	});
+
+	const result = await execute(card({ model: 'opus', agent: 'claude' }), ctx('run_no_cmd').value);
+
+	assert.equal(result.status, 'FAILED');
+	assert.match(String(result.error), /no modelCommand configured/);
 });
 
 test('completion is taken from Orca native agent state, not terminal output', async () => {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import test from 'node:test';
-import { createApp } from '../src/app.ts';
+import { createApp, type App } from '../src/app.ts';
 import { createHttpServer } from '../src/server.ts';
 import { fakeOrca, fakeOrchestration, silentLogger, testEnv } from './helpers.ts';
 import type { Card, SchedulerStatus } from '../src/types.ts';
@@ -12,7 +12,11 @@ type StateResponse = {
 	cards: Card[];
 	scheduler: SchedulerStatus;
 	eligible: string[];
-	config: { defaultAgent: string };
+	config: {
+		defaultAgent: string;
+		modelAgents: string[];
+		models: { default: string | null; choices: Array<{ id: string; label: string }> };
+	};
 };
 type CardResponse = { card: Card };
 type RunsResponse = { runs: unknown[] };
@@ -24,6 +28,7 @@ type ErrorResponse = { error: string };
 
 type Harness = {
 	base: string;
+	app: App;
 	stop: () => Promise<void>;
 	call: <T>(path: string, method?: string, body?: unknown) => Promise<{ status: number; json: T }>;
 };
@@ -49,6 +54,7 @@ async function harness(): Promise<Harness> {
 
 	return {
 		base,
+		app,
 		stop: async () => {
 			await app.scheduler.stop();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -154,6 +160,69 @@ test('the edit endpoint refuses what a live run is built on, and still takes the
 		assert.equal(edited.status, 200);
 		assert.equal(edited.json.card.title, 'renamed mid-run');
 		assert.equal(edited.json.card.repo, '/tmp/one');
+	} finally {
+		await h.stop();
+	}
+});
+
+test('the API refuses a model no agent can run, and records the default on new cards', async () => {
+	const h = await harness();
+	try {
+		// The harness config keeps omp's real catalog command, so this asks the agent that
+		// is actually installed — but the refusals below never need it.
+		const bad = await h.call<ErrorResponse>('/api/cards', 'POST', { title: 'nonsense model', model: 'gpt-9' });
+		assert.equal(bad.status, 409, 'a refused model is a 409, like a refused board rule');
+		assert.match(bad.json.error, /not in the model menu/);
+
+		const claude = await h.call<ErrorResponse>('/api/cards', 'POST', {
+			title: 'claude on opus',
+			agent: 'claude',
+			model: 'opus',
+		});
+		assert.equal(claude.status, 409);
+		assert.match(claude.json.error, /cannot be told which model/);
+
+		// An agent that cannot take one must not be handed the default either.
+		const plain = await h.call<CardResponse>('/api/cards', 'POST', { title: 'claude work', agent: 'claude' });
+		assert.equal(plain.status, 201);
+		assert.equal(plain.json.card.model, null);
+
+		const explicitNone = await h.call<CardResponse>('/api/cards', 'POST', { title: 'no model', model: null });
+		assert.equal(explicitNone.json.card.model, null, 'an explicit null is respected, not overwritten by the default');
+
+		const listed = await h.call<StateResponse>('/api/state');
+		assert.deepEqual(
+			listed.json.config.modelAgents,
+			['omp'],
+			'the UI is told which agents can take a model, so it can disable the select with a reason',
+		);
+		assert.equal(listed.json.config.models.default, 'opus');
+		assert.deepEqual(
+			listed.json.config.models.choices.map((c) => c.id),
+			['fable', 'opus', 'sonnet', 'haiku', 'sol', 'astra'],
+		);
+	} finally {
+		await h.stop();
+	}
+});
+
+test('re-sending the model a card already has needs no catalog and is not a change', async () => {
+	const h = await harness();
+	try {
+		const created = await h.call<CardResponse>('/api/cards', 'POST', { title: 'held model', model: null });
+		const id = created.json.card.id;
+		// Force a model onto the card without going through validation, as if it had been
+		// created when that model still existed.
+		h.app.board.updateCard(id, { model: 'withdrawn-model' });
+
+		const saved = await h.call<CardResponse>(`/api/cards/${id}`, 'PATCH', {
+			title: 'renamed',
+			model: 'withdrawn-model',
+		});
+
+		assert.equal(saved.status, 200, 'the panel can still edit a card whose model has gone away');
+		assert.equal(saved.json.card.title, 'renamed');
+		assert.equal(saved.json.card.model, 'withdrawn-model');
 	} finally {
 		await h.stop();
 	}

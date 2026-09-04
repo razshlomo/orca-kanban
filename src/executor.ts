@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { buildFallbackCommand } from './agents.ts';
+import { buildFallbackCommand, buildModelCommand } from './agents.ts';
 import { kanbanHome, resolveAgent } from './config.ts';
 import { excludeLocally, gitSnapshot } from './git.ts';
 import { CONTROL_DIR as GUARD_CONTROL_DIR, MARKER_FILE } from './guard.ts';
@@ -117,6 +117,9 @@ export function statusFromText(text: string | null): AgentStatus | null {
 	return null;
 }
 
+/** Either the model to launch on, or why this card must not start. */
+export type ModelResolution = { ok: true; selector: string } | { ok: false; reason: string };
+
 export type OrcaExecutorDeps = {
 	orca: OrcaApi;
 	config: KanbanConfig;
@@ -124,6 +127,13 @@ export type OrcaExecutorDeps = {
 	/** Reviewer comments and the last attempt, so a card sent back knows why. */
 	lookupBackstory?: (id: string) => CardBackstory;
 	orchestration: OrchestrationApi;
+	/**
+	 * Turns the card's model alias into a concrete model, or explains why it cannot.
+	 *
+	 * Injected rather than imported so the resolver owns the catalog cache and the
+	 * config, and so a test can decide what "opus" means without running an agent CLI.
+	 */
+	resolveModel?: (agentName: string, model: string) => Promise<ModelResolution>;
 };
 
 type CompletionOutcome = {
@@ -146,7 +156,7 @@ type CompletionOutcome = {
  *    result file, because Orca reports liveness, not verdicts.
  */
 export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
-	const { orca, config, lookupCard, lookupBackstory, orchestration } = deps;
+	const { orca, config, lookupCard, lookupBackstory, orchestration, resolveModel } = deps;
 
 	return async function executeOneCard(card: Card, ctx: ExecuteContext): Promise<ExecutionResult> {
 		const startedAt = Date.now();
@@ -167,6 +177,8 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 			lint: null,
 			typecheck: null,
 			concerns: null,
+			model: card.model,
+			modelSelector: null,
 			startedAt,
 			finishedAt: startedAt,
 		};
@@ -184,6 +196,34 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 
 		const { name: agentName, agent } = resolveAgent(config, card.agent);
 		const resuming = ctx.resume !== undefined;
+
+		// Resolve the model BEFORE anything exists. The card stores an alias, not a
+		// version, so "opus" has to be turned into a concrete model now — and if it
+		// cannot be, the card is blocked with the reason instead of being launched on
+		// whatever the agent defaults to, or failing 45 minutes later as a timeout.
+		let modelSelector: string | null = null;
+		if (card.model && !resuming) {
+			if (!resolveModel) {
+				return {
+					...base,
+					status: 'BLOCKED',
+					completionReason: 'gone',
+					error: `Card asks for model "${card.model}" but this board was built without a model resolver.`,
+					finishedAt: Date.now(),
+				};
+			}
+			const resolution = await resolveModel(agentName, card.model);
+			if (!resolution.ok) {
+				return {
+					...base,
+					status: 'BLOCKED',
+					completionReason: 'gone',
+					error: resolution.reason,
+					finishedAt: Date.now(),
+				};
+			}
+			modelSelector = resolution.selector;
+		}
 
 		let sessionId: string | null = ctx.resume?.sessionId ?? null;
 		let worktreeId: string | null = ctx.resume?.worktreeId ?? null;
@@ -219,8 +259,11 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 					name,
 					baseBranch: config.baseBranch,
 					comment: `Kanban ${card.id}: running`,
-					agentId: agent.orcaAgentId,
-					prompt,
+					// Orca's own launch cannot carry a model, so a card that names one is
+					// started below as a terminal command instead. Orca still reports its
+					// agent in `worktree ps`, which is what the completion watch reads.
+					agentId: modelSelector ? null : agent.orcaAgentId,
+					...(modelSelector ? {} : { prompt }),
 					setup: config.setupPolicy,
 				});
 
@@ -258,18 +301,28 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 					'utf8',
 				);
 
-				// Orca launches the agent itself; this only covers agents it cannot.
+				// Orca launches the agent itself, except when the card names a model: that
+				// needs a flag only the agent's own CLI understands, so the board starts the
+				// agent as a terminal command instead. Verified against the real CLI: omp
+				// launched this way sends the `@file` message on its own, does the work, and
+				// is reported by `worktree ps` as `agentType: omp` with its state and final
+				// message — so completion, take-over and the summary all keep working.
 				if (!sessionId) {
 					const promptFile = path.join(worktreePath, CONTROL_DIR, `prompt-${effectiveRunId}.md`);
 					writeFileSync(promptFile, prompt, 'utf8');
-					const command = buildFallbackCommand(agent, {
+					const vars = {
 						promptFile,
 						promptFileRel: path.join(CONTROL_DIR, `prompt-${effectiveRunId}.md`),
 						prompt,
-					});
+					};
+					const command = modelSelector
+						? buildModelCommand(agent, { ...vars, model: modelSelector })
+						: buildFallbackCommand(agent, vars);
 					if (!command) {
 						throw new Error(
-							`Orca did not return an agent terminal for agent "${agentName}" and no fallbackCommand is configured.`,
+							modelSelector
+								? `Agent "${agentName}" has no modelCommand configured, so it cannot run on model ${modelSelector}.`
+								: `Orca did not return an agent terminal for agent "${agentName}" and no fallbackCommand is configured.`,
 						);
 					}
 					const terminal = await orca.terminalCreate({
@@ -288,6 +341,8 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 					worktreePath,
 					branch,
 					agent: agentName,
+					model: card.model,
+					modelSelector,
 					orcaAgentId: agent.orcaAgentId,
 				});
 
@@ -381,6 +436,7 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 					branch,
 					worktreePath,
 					worktreeId,
+					modelSelector,
 					agentResponse: completion.agentResponse,
 					finishedAt: Date.now(),
 				};
@@ -440,6 +496,7 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 				branch,
 				worktreePath,
 				worktreeId,
+				modelSelector,
 				commitSha,
 				summary: result?.summary ?? null,
 				error,
@@ -459,6 +516,7 @@ export function createOrcaExecutor(deps: OrcaExecutorDeps): CardExecutor {
 				sessionId,
 				branch,
 				worktreePath,
+				modelSelector,
 				worktreeId,
 				error: `Execution error: ${(err as Error).message}`,
 				finishedAt: Date.now(),

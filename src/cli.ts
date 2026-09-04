@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import { createApp } from './app.ts';
 import { BoardRuleError, schedulerLiveness } from './board.ts';
+import { resolveAgent } from './config.ts';
 import { gitReviewDiff } from './git.ts';
 import { describeCommit, commitCardWork, describeDrop, describeLanding } from './land.ts';
 import { describeResume, resumeCardSession } from './resume.ts';
 import { formatRelative, parseDueAt, parseDuration } from './text.ts';
+import { assertModel, defaultModelFor, ModelError, modelMenu } from './models.ts';
 import { assertBoardWritable, assertSchedulerFree, CardWorkerGuardError, SchedulerBusyError } from './guard.ts';
 import {
 	installService,
@@ -42,6 +44,7 @@ Usage:
   orca-kanban card land <id> [--keep-branch]     Merge an approved card into the base branch
   orca-kanban card drop <id> [--force]           Throw away its branch, keep the card and trail
   orca-kanban recover                            Reconcile cards stranded In Progress
+  orca-kanban models [--agent <n>] [--refresh]   Show the model menu and what each name means
   orca-kanban status                             Show board + scheduler status
   orca-kanban doctor                             Check Orca connectivity and config
   orca-kanban service <op> [--no-autostart]      Run the board as a background service
@@ -51,6 +54,7 @@ Usage:
 Card options:
   --description <text>   --acceptance <text>   --priority <n>
   --deps <id,id>         --repo <path|id:…>    --agent <name>
+  --model <name>         from \`kanban models\`; "none" = the agent's own default
   --max-attempts <n>     --state <state>       --force (override card-worktree guard)
   --not-before <7d|ISO>  hold until due        --every <1w>  re-run on that interval
   --title <text>         update only; --state is not accepted there, use card move
@@ -117,6 +121,7 @@ const UPDATE_FLAGS = [
 	'deps',
 	'repo',
 	'agent',
+	'model',
 	'not-before',
 	'every',
 ] as const;
@@ -352,13 +357,30 @@ async function main(): Promise<number> {
 					input.repeatEveryMs = interval;
 				}
 
+				// The default is applied HERE, not at launch, so the card says which model it
+				// runs and a queued card cannot change model because config changed. `none`
+				// means "the agent's own default", which is what every card did before models.
+				const modelFlag = flagStr(args, 'model');
+				const requested = modelFlag === undefined ? defaultModelFor(app.config, input.agent ?? null) : clearable(modelFlag);
+				if (requested) {
+					const { name: agentName } = resolveAgent(app.config, input.agent ?? null);
+					const { selector } = await assertModel({
+						config: app.config,
+						store: app.board,
+						agentName,
+						model: requested,
+					});
+					input.model = requested;
+					process.stderr.write(`model ${requested} → ${selector}\n`);
+				}
+
 				const card = app.board.createCard(input);
 				const schedule = [
 					card.notBefore ? `due ${formatRelative(card.notBefore)}` : null,
 					card.repeatEveryMs ? `repeats` : null,
 				].filter(Boolean);
 				process.stdout.write(
-					`${card.id}  ${card.state}  P${card.priority}  ${card.title}` +
+					`${card.id}  ${card.state}  P${card.priority}  ${card.model ?? 'agent default'}  ${card.title}` +
 						`${schedule.length > 0 ? `  (${schedule.join(', ')})` : ''}\n`,
 				);
 				return 0;
@@ -414,6 +436,28 @@ async function main(): Promise<number> {
 
 				const agent = flagStr(args, 'agent');
 				if (agent !== undefined) patch.agent = clearable(agent);
+
+				const model = flagStr(args, 'model');
+				if (model !== undefined) {
+					const requested = clearable(model);
+					if (requested === null) patch.model = null;
+					else {
+						// Checked against the agent the card will actually use, which may be the
+						// one being set in this same command.
+						const { name: agentName } = resolveAgent(
+							app.config,
+							patch.agent === undefined ? before.agent : patch.agent,
+						);
+						const { selector } = await assertModel({
+							config: app.config,
+							store: app.board,
+							agentName,
+							model: requested,
+						});
+						patch.model = requested;
+						process.stderr.write(`model ${requested} → ${selector}\n`);
+					}
+				}
 
 				const deps = flagStr(args, 'deps');
 				if (deps !== undefined) {
@@ -817,6 +861,43 @@ async function main(): Promise<number> {
 		return 1;
 	}
 
+	// ---------------------------------------------------------------- models
+	if (command === 'models') {
+		const app = createApp();
+		try {
+			const menu = await modelMenu({
+				config: app.config,
+				store: app.board,
+				agentName: flagStr(args, 'agent') ?? null,
+				refresh: args.flags['refresh'] === true,
+			});
+
+			const age =
+				menu.fetchedAt === null
+					? 'never read'
+					: Date.now() - menu.fetchedAt < 60_000
+						? 'read just now'
+						: `read ${formatRelative(menu.fetchedAt)}`;
+			process.stdout.write(`agent: ${menu.agent} · catalog ${age}${menu.stale ? ' (stale — the last fetch failed)' : ''}\n`);
+			if (menu.error) process.stderr.write(`${menu.error}\n`);
+
+			for (const entry of menu.entries) {
+				const resolved = entry.selector
+					? `${entry.selector}${entry.candidates > 1 ? ` (newest of ${entry.candidates})` : ''}`
+					: `unavailable — ${entry.reason ?? 'no match'}`;
+				process.stdout.write(
+					`${entry.choice.id.padEnd(8)} ${entry.choice.label.padEnd(14)} ${entry.isDefault ? '*' : ' '} ${resolved}\n`,
+				);
+			}
+			// An empty menu would otherwise read as "no models exist", which is a config
+			// problem and not a catalog one.
+			if (menu.entries.length === 0) process.stdout.write('(no models.choices configured)\n');
+			return menu.entries.some((e) => e.selector) || menu.entries.length === 0 ? 0 : 1;
+		} finally {
+			app.close();
+		}
+	}
+
 	// ---------------------------------------------------------------- status
 	if (command === 'status') {
 		const app = createApp();
@@ -942,12 +1023,17 @@ main()
 	.catch((err: Error) => {
 		// The guard message is already formatted for a human/agent to act on.
 		const refused =
-			err instanceof CardWorkerGuardError || err instanceof BoardRuleError || err instanceof SchedulerBusyError;
+			err instanceof CardWorkerGuardError ||
+			err instanceof BoardRuleError ||
+			err instanceof SchedulerBusyError ||
+			err instanceof ModelError;
 		process.stderr.write(refused ? `${err.message}\n` : `error: ${err.message}\n`);
 		process.exitCode =
 			err instanceof CardWorkerGuardError
 				? 3
-				: err instanceof BoardRuleError
+				: // A refused model is the same kind of answer as a refused board edit: the
+					// request was understood and the board will not do it.
+					err instanceof BoardRuleError || err instanceof ModelError
 					? 4
 					: err instanceof SchedulerBusyError
 						? 5

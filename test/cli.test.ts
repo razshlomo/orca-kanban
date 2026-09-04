@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -46,6 +46,32 @@ function boardWithCard(state: CardState = 'Backlog'): { home: string; id: string
 	if (state === 'In Progress') board.claimCard(card.id, 'worker-1');
 	board.close();
 	return { home, id: card.id };
+}
+
+/**
+ * A home whose omp agent reads its catalog from a file, so these tests never depend
+ * on a real agent binary or on which models happen to exist today.
+ */
+function boardWithModels(): { home: string } {
+	const home = mkdtempSync(path.join(tmpdir(), 'cli-model-'));
+	const catalog = path.join(home, 'catalog.json');
+	writeFileSync(
+		catalog,
+		JSON.stringify({
+			models: [
+				{ provider: 'anthropic', id: 'claude-opus-4-8', selector: 'anthropic/claude-opus-4-8' },
+				{ provider: 'anthropic', id: 'claude-opus-5', selector: 'anthropic/claude-opus-5' },
+				{ provider: 'anthropic', id: 'claude-haiku-4-5', selector: 'anthropic/claude-haiku-4-5' },
+			],
+		}),
+		'utf8',
+	);
+	writeFileSync(
+		path.join(home, 'config.json'),
+		JSON.stringify({ agents: { omp: { modelsCommand: `cat ${catalog}`, modelsFormat: 'json', modelsRefreshCommand: null } } }),
+		'utf8',
+	);
+	return { home };
 }
 
 function kanban(home: string, argv: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -154,6 +180,78 @@ test('a running card refuses an edit its agent depends on, with exit code 4', as
 	const forced = await kanban(home, ['card', 'update', id, '--repo', '/tmp/two', '--force']);
 	assert.equal(forced.code, 0, forced.stderr);
 	assert.equal(reread(home, id).repo, '/tmp/two');
+});
+
+test('a new card records the default model, and "none" leaves it to the agent', async () => {
+	const { home } = boardWithModels();
+
+	const created = await kanban(home, ['card', 'add', 'with the default model', '--repo', '/tmp/one']);
+	assert.equal(created.code, 0, created.stderr);
+	const id = created.stdout.trim().split(/\s+/)[0] as string;
+	assert.equal(reread(home, id).model, 'opus', 'the default is written onto the card, not left in config');
+	assert.match(created.stderr, /model opus → anthropic\/claude-opus-5/, 'and it says which model that is today');
+
+	const bare = await kanban(home, ['card', 'add', 'no model at all', '--repo', '/tmp/one', '--model', 'none']);
+	assert.equal(bare.code, 0, bare.stderr);
+	assert.equal(reread(home, bare.stdout.trim().split(/\s+/)[0] as string).model, null);
+
+	// A claude card cannot be told its model, so it must not silently get the default.
+	const claude = await kanban(home, ['card', 'add', 'claude work', '--repo', '/tmp/one', '--agent', 'claude']);
+	assert.equal(claude.code, 0, claude.stderr);
+	assert.equal(reread(home, claude.stdout.trim().split(/\s+/)[0] as string).model, null);
+});
+
+test('a model the agent cannot run is refused with exit code 4, and no card is created', async () => {
+	const { home } = boardWithModels();
+
+	const unreleased = await kanban(home, ['card', 'add', 'on astra', '--repo', '/tmp/one', '--model', 'astra']);
+	assert.equal(unreleased.code, 4, unreleased.stderr);
+	assert.match(unreleased.stderr, /may not be released yet/);
+
+	const nonsense = await kanban(home, ['card', 'add', 'on nonsense', '--repo', '/tmp/one', '--model', 'gpt-9']);
+	assert.equal(nonsense.code, 4, nonsense.stderr);
+	assert.match(nonsense.stderr, /not in the model menu/);
+
+	const withClaude = await kanban(home, [
+		'card', 'add', 'claude on opus', '--repo', '/tmp/one', '--agent', 'claude', '--model', 'opus',
+	]);
+	assert.equal(withClaude.code, 4, withClaude.stderr);
+	assert.match(withClaude.stderr, /cannot be told which model/);
+
+	const listing = await kanban(home, ['card', 'list']);
+	assert.match(listing.stdout, /no cards/, 'a refused model leaves nothing behind');
+});
+
+test('card update changes the model, and clears it on "none"', async () => {
+	const { home } = boardWithModels();
+	const created = await kanban(home, ['card', 'add', 'switchable', '--repo', '/tmp/one']);
+	const id = created.stdout.trim().split(/\s+/)[0] as string;
+
+	const changed = await kanban(home, ['card', 'update', id, '--model', 'haiku']);
+	assert.equal(changed.code, 0, changed.stderr);
+	assert.match(changed.stdout, /model: opus → haiku/);
+	assert.equal(reread(home, id).model, 'haiku');
+
+	const cleared = await kanban(home, ['card', 'update', id, '--model', 'none']);
+	assert.equal(cleared.code, 0, cleared.stderr);
+	assert.equal(reread(home, id).model, null);
+
+	const refused = await kanban(home, ['card', 'update', id, '--model', 'astra']);
+	assert.equal(refused.code, 4, refused.stderr);
+	assert.equal(reread(home, id).model, null, 'a refused model does not half-apply');
+});
+
+test('kanban models says what every name means today, and which one cannot be used', async () => {
+	const { home } = boardWithModels();
+	const res = await kanban(home, ['models']);
+
+	assert.match(res.stdout, /agent: omp/);
+	assert.match(res.stdout, /opus\s+Opus\s+\*\s+anthropic\/claude-opus-5 \(newest of 2\)/, 'newest wins, and the default is marked');
+	assert.match(res.stdout, /haiku\s+Haiku\s+anthropic\/claude-haiku-4-5/);
+	assert.match(res.stdout, /astra\s+Astra \(codex\)\s+unavailable/);
+	// Nothing at all resolving is a failure worth an exit code; this catalog resolves
+	// three of the six, so the command succeeds.
+	assert.equal(res.code, 0, res.stderr);
 });
 
 test('piping a long listing into head is a clean exit, not an EPIPE crash', async () => {

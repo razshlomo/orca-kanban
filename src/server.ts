@@ -2,10 +2,11 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { EDITABLE_FIELDS, configPath, readConfigField } from './config.ts';
+import { EDITABLE_FIELDS, configPath, readConfigField, resolveAgent } from './config.ts';
 import { gitReviewDiff } from './git.ts';
 import { commitCardWork, describeDrop, describeLanding, planLanding } from './land.ts';
 import { describeResume, resumeCardSession } from './resume.ts';
+import { agentSupportsModels, assertModel, defaultModelFor, ModelError, modelMenu } from './models.ts';
 import {
 	installService,
 	serviceState,
@@ -95,6 +96,8 @@ function cardInputFrom(body: Record<string, unknown>): Partial<CardInput> & { st
 	if (Array.isArray(body['dependencies'])) patch.dependencies = body['dependencies'].map(String);
 	if ('repo' in body) patch.repo = str(body['repo']) ?? null;
 	if ('agent' in body) patch.agent = str(body['agent']) ?? null;
+	// Clearable: an explicit null means "the agent's own default".
+	if ('model' in body) patch.model = str(body['model']) ?? null;
 	// A schedule is clearable, so an explicit null must survive as null.
 	if ('notBefore' in body) patch.notBefore = num(body['notBefore']) ?? null;
 	if ('repeatEveryMs' in body) patch.repeatEveryMs = num(body['repeatEveryMs']) ?? null;
@@ -134,6 +137,17 @@ function stateSnapshot(app: App): Record<string, unknown> {
 			resumableAgents: Object.entries(app.config.agents)
 				.filter(([, a]) => a.resumeCommand)
 				.map(([name]) => name),
+			// Which agents can take a model at all, so the panel can explain a disabled
+			// select instead of offering a choice that would be refused on save.
+			modelAgents: Object.entries(app.config.agents)
+				.filter(([, a]) => agentSupportsModels(a))
+				.map(([name]) => name),
+			// The menu itself, without resolving it: resolution shells out to the agent, and
+			// this snapshot is polled every couple of seconds. `GET /api/models` resolves.
+			models: {
+				default: app.config.models.default,
+				choices: app.config.models.choices.map((c) => ({ id: c.id, label: c.label })),
+			},
 			mirrorToOrcaBoard: app.config.mirrorToOrcaBoard,
 			orchestrationEnabled: app.config.orchestration.enabled,
 			enabled: app.config.enabled,
@@ -161,9 +175,14 @@ export function createHttpServer(app: App): Server {
 		void handle(app, session, req, res).catch((err: Error) => {
 			if (res.headersSent) return;
 			// A refused transition is the caller asking for something the board's rules
-			// forbid — a 409 with the reason, not an opaque 500.
+			// forbid — a 409 with the reason, not an opaque 500. A refused model is the
+			// same kind of answer, so it reads the same way to the UI.
 			if (err instanceof BoardRuleError) {
 				send(res, 409, { error: err.message, cardId: err.cardId, state: err.state });
+				return;
+			}
+			if (err instanceof ModelError) {
+				send(res, 409, { error: err.message, agent: err.agent, model: err.model, available: err.available });
 				return;
 			}
 			send(res, 500, { error: err.message });
@@ -192,6 +211,32 @@ async function handle(app: App, session: Session, req: IncomingMessage, res: Ser
 		return;
 	}
 
+	// Resolved on demand, never on the state poll: resolving runs the agent's own CLI.
+	// The panel asks once per agent and caches, the same way it caches the land probe.
+	if (route === '/api/models' && method === 'GET') {
+		const menu = await modelMenu({
+			config: app.config,
+			store: app.board,
+			agentName: url.searchParams.get('agent'),
+			refresh: url.searchParams.get('refresh') === '1',
+		});
+		send(res, 200, {
+			agent: menu.agent,
+			fetchedAt: menu.fetchedAt,
+			stale: menu.stale,
+			error: menu.error,
+			models: menu.entries.map((e) => ({
+				id: e.choice.id,
+				label: e.choice.label,
+				selector: e.selector,
+				candidates: e.candidates,
+				reason: e.reason,
+				isDefault: e.isDefault,
+			})),
+		});
+		return;
+	}
+
 	if (route === '/api/cards' && method === 'GET') {
 		send(res, 200, { cards: app.board.listCards() });
 		return;
@@ -202,7 +247,20 @@ async function handle(app: App, session: Session, req: IncomingMessage, res: Ser
 		const title = str(body['title'])?.trim();
 		if (!title) return send(res, 400, { error: 'title is required' });
 		const input = cardInputFrom(body);
-		const card = app.board.createCard({ ...input, title, state: input.state ?? 'Backlog' });
+
+		// New cards get the default model, so the card records what it will run on
+		// instead of inheriting a setting that can change under it while it waits.
+		const model = 'model' in body ? (input.model ?? null) : defaultModelFor(app.config, input.agent ?? null);
+		if (model) {
+			await assertModel({
+				config: app.config,
+				store: app.board,
+				agentName: resolveAgent(app.config, input.agent ?? null).name,
+				model,
+			});
+		}
+
+		const card = app.board.createCard({ ...input, title, model, state: input.state ?? 'Backlog' });
 		send(res, 201, { card });
 		return;
 	}
@@ -216,7 +274,21 @@ async function handle(app: App, session: Session, req: IncomingMessage, res: Ser
 
 		if (!action && method === 'PATCH') {
 			const body = await readBody(req);
-			const updated = app.board.updateCard(id, cardInputFrom(body));
+			const patch = cardInputFrom(body);
+
+			// Checked before the write, and only when it actually changes: the panel saves
+			// the whole card on every edit, so re-sending the model it already has must not
+			// cost a catalog read or start failing when a model is later withdrawn.
+			if (patch.model && patch.model !== card.model) {
+				await assertModel({
+					config: app.config,
+					store: app.board,
+					agentName: resolveAgent(app.config, patch.agent === undefined ? card.agent : patch.agent).name,
+					model: patch.model,
+				});
+			}
+
+			const updated = app.board.updateCard(id, patch);
 			// An edit that changes state must move the Orca card too.
 			if (updated && updated.state !== card.state) await app.mirrorCard(updated);
 			send(res, 200, { card: updated });

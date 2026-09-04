@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
 import path from 'node:path';
-import type { AgentConfig, CardState, KanbanConfig } from './types.ts';
+import type { AgentConfig, CardState, KanbanConfig, ModelChoice } from './types.ts';
 
 /**
  * Home for the board database, config, and logs.
@@ -15,6 +15,13 @@ export function kanbanHome(): string {
  * Agents are Orca's own agent ids. Orca launches them itself via
  * `orca worktree create --agent <id> --prompt <text>`, which is the documented
  * agent-first path and delivers the prompt without touching the TUI.
+ *
+ * `modelCommand` is the exception to that path. Orca has no way to carry a model —
+ * `worktree create` takes `--agent` and `--prompt` and nothing else — so a card that
+ * names a model is launched as a plain terminal command instead. Orca still tracks it:
+ * `worktree ps` reports `agents[].state` for any terminal running a known agent, which
+ * is what the executor watches. An agent with no `modelCommand`/`modelsCommand` cannot
+ * be asked for a model, and such a card is refused rather than run on the wrong one.
  */
 export const DEFAULT_AGENTS: Record<string, AgentConfig> = {
 	// `--continue` resumes the newest session for the current directory, and every card
@@ -23,13 +30,80 @@ export const DEFAULT_AGENTS: Record<string, AgentConfig> = {
 		orcaAgentId: 'omp',
 		fallbackCommand: 'omp --auto-approve {{promptFileRel}}',
 		resumeCommand: 'omp --continue',
+		modelCommand: 'omp --auto-approve --model {{model}} {{promptFileRel}}',
+		modelsCommand: 'omp models --json',
+		modelsFormat: 'json',
+		modelsRefreshCommand: 'omp models refresh',
 	},
-	codex: { orcaAgentId: 'codex', fallbackCommand: null, resumeCommand: 'codex resume --last' },
-	claude: { orcaAgentId: 'claude', fallbackCommand: null, resumeCommand: 'claude --continue' },
-	cursor: { orcaAgentId: 'cursor', fallbackCommand: null, resumeCommand: null },
-	opencode: { orcaAgentId: 'opencode', fallbackCommand: null, resumeCommand: null },
-	pi: { orcaAgentId: 'pi', fallbackCommand: null, resumeCommand: null },
+	codex: {
+		orcaAgentId: 'codex',
+		fallbackCommand: null,
+		resumeCommand: 'codex resume --last',
+		modelCommand: null,
+		modelsCommand: null,
+		modelsFormat: 'lines',
+		modelsRefreshCommand: null,
+	},
+	claude: {
+		orcaAgentId: 'claude',
+		fallbackCommand: null,
+		resumeCommand: 'claude --continue',
+		modelCommand: null,
+		modelsCommand: null,
+		modelsFormat: 'lines',
+		modelsRefreshCommand: null,
+	},
+	cursor: {
+		orcaAgentId: 'cursor',
+		fallbackCommand: null,
+		resumeCommand: null,
+		modelCommand: null,
+		modelsCommand: null,
+		modelsFormat: 'lines',
+		modelsRefreshCommand: null,
+	},
+	opencode: {
+		orcaAgentId: 'opencode',
+		fallbackCommand: null,
+		resumeCommand: null,
+		modelCommand: null,
+		modelsCommand: null,
+		modelsFormat: 'lines',
+		modelsRefreshCommand: null,
+	},
+	pi: {
+		orcaAgentId: 'pi',
+		fallbackCommand: null,
+		resumeCommand: null,
+		modelCommand: null,
+		modelsCommand: null,
+		modelsFormat: 'lines',
+		modelsRefreshCommand: null,
+	},
 };
+
+/**
+ * The model menu, by name rather than by version.
+ *
+ * Model versions move every few weeks, so pinning `claude-opus-5` here would make this
+ * list wrong by the next release. Each entry says which family it means and the newest
+ * matching model in the agent's own catalog wins — `opus` was Opus 4.5 in November and
+ * is Opus 5 now, with nothing to edit in between.
+ *
+ * `astra` is deliberately listed before it exists. Until the agent's catalog has it,
+ * picking it is refused with that reason; the day it ships, `kanban models --refresh`
+ * is the whole migration.
+ */
+export const DEFAULT_MODEL_CHOICES: ModelChoice[] = [
+	{ id: 'fable', label: 'Fable', match: 'claude-fable', providers: ['anthropic'] },
+	{ id: 'opus', label: 'Opus', match: 'claude-opus', providers: ['anthropic'] },
+	{ id: 'sonnet', label: 'Sonnet', match: 'claude-sonnet', providers: ['anthropic'] },
+	{ id: 'haiku', label: 'Haiku', match: 'claude-haiku', providers: ['anthropic'] },
+	{ id: 'sol', label: 'Sol (codex)', match: 'sol', providers: ['openai-codex'] },
+	// Shipped as openai-codex/gpt-6-astra. `match` stays the bare name so the next
+	// version of it resolves without touching this list.
+	{ id: 'astra', label: 'Astra (codex)', match: 'astra', providers: ['openai-codex'] },
+];
 
 /**
  * Card state -> Orca workspaceStatus id.
@@ -80,6 +154,7 @@ export const DEFAULT_CONFIG: KanbanConfig = {
 		runId: null,
 	},
 	agents: DEFAULT_AGENTS,
+	models: { default: 'opus', choices: DEFAULT_MODEL_CHOICES },
 };
 
 export function configPath(): string {
@@ -119,9 +194,29 @@ export function mergeConfig(onDisk: Partial<KanbanConfig>, overrides: Partial<Ka
 	const agents: Record<string, AgentConfig> = { ...DEFAULT_AGENTS };
 	for (const source of [onDisk.agents, overrides.agents]) {
 		for (const [name, cfg] of Object.entries(source ?? {})) {
-			agents[name] = { ...(agents[name] ?? { orcaAgentId: name, fallbackCommand: null, resumeCommand: null }), ...cfg };
+			agents[name] = {
+				...(agents[name] ?? {
+					orcaAgentId: name,
+					fallbackCommand: null,
+					resumeCommand: null,
+					modelCommand: null,
+								modelsCommand: null,
+					modelsFormat: 'lines',
+					modelsRefreshCommand: null,
+				}),
+				...cfg,
+			};
 		}
 	}
+
+	// A menu given on disk REPLACES the shipped one rather than merging into it:
+	// removing an entry is the whole point of writing your own list, and a merge would
+	// keep resurrecting the defaults you deleted.
+	const models = {
+		...DEFAULT_CONFIG.models,
+		...onDisk.models,
+		...overrides.models,
+	};
 
 	return {
 		...DEFAULT_CONFIG,
@@ -130,6 +225,7 @@ export function mergeConfig(onDisk: Partial<KanbanConfig>, overrides: Partial<Ka
 		orcaStatusMap: { ...DEFAULT_ORCA_STATUS_MAP, ...onDisk.orcaStatusMap, ...overrides.orcaStatusMap },
 		orchestration: { ...DEFAULT_CONFIG.orchestration, ...onDisk.orchestration, ...overrides.orchestration },
 		agents,
+		models,
 	};
 }
 
@@ -152,6 +248,18 @@ export function validateConfig(merged: KanbanConfig): KanbanConfig {
 	if (merged.resultGraceMs < 0) throw new Error('resultGraceMs must be >= 0');
 	if (!Number.isInteger(merged.port) || merged.port < 1 || merged.port > 65_535) {
 		throw new Error('port must be a whole number between 1 and 65535');
+	}
+
+	const ids = merged.models.choices.map((c) => c.id);
+	for (const choice of merged.models.choices) {
+		if (!choice.id || !choice.label) throw new Error('every models.choices entry needs an id and a label');
+		if (!choice.match && !choice.selector) {
+			throw new Error(`models.choices "${choice.id}" needs either match (newest wins) or selector (pinned)`);
+		}
+	}
+	if (new Set(ids).size !== ids.length) throw new Error(`models.choices has duplicate ids: ${ids.join(', ')}`);
+	if (merged.models.default !== null && !ids.includes(merged.models.default)) {
+		throw new Error(`models.default "${merged.models.default}" is not one of models.choices (have: ${ids.join(', ')})`);
 	}
 	return merged;
 }
@@ -217,6 +325,9 @@ export const EDITABLE_FIELDS: Record<string, ConfigFieldSpec> = {
 	autoRun: { kind: 'boolean', hot: true, label: 'Auto-run cards' },
 	maxConcurrent: { kind: 'number', min: 1, integer: true, hot: true, label: 'Concurrent cards' },
 	defaultAgent: { kind: 'string', hot: true, label: 'Default agent' },
+	// Validated against models.choices by validateConfig, so a typo is refused before
+	// it reaches disk rather than silently blocking every new card.
+	'models.default': { kind: 'string', nullable: true, hot: true, label: 'Default model' },
 	defaultRepo: { kind: 'string', nullable: true, hot: true, label: 'Default repo' },
 	baseBranch: { kind: 'string', nullable: true, hot: true, label: 'Base branch' },
 	maxAttempts: { kind: 'number', min: 1, integer: true, hot: true, label: 'Attempts per card' },

@@ -1,9 +1,10 @@
 import { Board } from './board.ts';
 import { loadConfig, loadConfigSafe, readConfigField, saveConfig, writeConfigField } from './config.ts';
 import { openDb } from './db.ts';
-import { createOrcaExecutor } from './executor.ts';
+import { createOrcaExecutor, type ModelResolution } from './executor.ts';
 import { createLogger, type Logger } from './logger.ts';
 import { commentForCard, mirrorCardToOrca } from './mirror.ts';
+import { assertModel } from './models.ts';
 import {
 	describeDrop,
 	describeLanding,
@@ -96,12 +97,28 @@ export function createApp(
 			? new OrcaOrchestration({ log, runId: config.orchestration.runId })
 			: disabledOrchestration);
 
+	/**
+	 * The card stores an alias; this turns it into the model that alias means today,
+	 * using the catalog cached in the board. Re-checked here rather than trusted from
+	 * create time, because the menu, the agent and the catalog can all change between
+	 * writing a card and running it.
+	 */
+	const resolveModel = async (agentName: string, model: string): Promise<ModelResolution> => {
+		try {
+			const { selector } = await assertModel({ config, store: board, agentName, model });
+			return { ok: true, selector };
+		} catch (err) {
+			return { ok: false, reason: (err as Error).message };
+		}
+	};
+
 	const executor = createOrcaExecutor({
 		orca,
 		config,
 		orchestration,
 		lookupCard: (id) => board.getCard(id),
 		lookupBackstory: (id) => board.backstoryFor(id),
+		resolveModel,
 	});
 
 	const mirror = async (card: Card, state: CardState, comment?: string): Promise<void> => {

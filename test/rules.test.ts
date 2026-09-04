@@ -79,6 +79,8 @@ test('the commit message names the card and carries the agent summary', async ()
 			error: null,
 			agentResponse: null,
 			filesChanged: [],
+			model: null,
+			modelSelector: null,
 			testsRun: [],
 			lint: null,
 			typecheck: null,
@@ -194,6 +196,7 @@ test('a running card refuses the edits its live run is built on, and allows the 
 	for (const patch of [
 		{ repo: '/tmp/two' },
 		{ agent: 'codex' },
+		{ model: 'sonnet' },
 		{ maxAttempts: 5 },
 		{ dependencies: [other.id] },
 		{ state: 'Done' as CardState },
@@ -214,6 +217,7 @@ test('a running card refuses the edits its live run is built on, and allows the 
 		description: 'more detail',
 		priority: 9,
 		repo: '/tmp/one',
+		model: null,
 		maxAttempts: 2,
 		dependencies: [],
 	});

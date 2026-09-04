@@ -312,6 +312,12 @@
 			/** The server's answer about whether one card may be landed right now. */
 			let landCache = { cardId: null, probe: null };
 
+			/**
+			 * The resolved model menu, per agent. Resolving runs the agent's own CLI, so it is
+			 * asked for once per agent and reused — the same reason the land probe is cached.
+			 */
+			let modelCache = { agent: null, menu: null };
+
 			function render() {
 				const s = snapshot.scheduler || {};
 				const running = s.runState === 'running';
@@ -473,6 +479,7 @@
 				['f-max', 'maxAttempts'],
 				['f-repo', 'repo'],
 				['f-agent', 'agent'],
+				['f-model', 'model'],
 				['f-deps', 'dependencies'],
 				['f-hold', 'hold'],
 				['f-every', 'every'],
@@ -620,6 +627,25 @@
 					why.land = probe.why || why.land;
 				}
 
+				// What each model name means for THIS card's agent, and which ones exist right
+				// now. An agent that cannot be told its model gets no menu at all.
+				const cardAgent = c.agent || snapshot.config.defaultAgent;
+				const modelAgents = snapshot.config.modelAgents || [];
+				const agentTakesModel = modelAgents.includes(cardAgent);
+				if (agentTakesModel && modelCache.agent !== cardAgent) {
+					modelCache = { agent: cardAgent, menu: null };
+					try { modelCache.menu = await api(`/api/models?agent=${encodeURIComponent(cardAgent)}`); } catch {}
+				}
+				const modelMenu = agentTakesModel && modelCache.agent === cardAgent ? modelCache.menu : null;
+				const modelLocked = running || mine;
+				const whyModel = !agentTakesModel
+					? `${cardAgent} cannot be told which model to use`
+					: mine
+						? 'You are holding this card by hand — take it back first'
+						: running
+							? 'An agent is running on this model right now; stop the card to change it'
+							: '';
+
 				// Open what this card's state is actually about, unless the user chose.
 				const open = (name, fallback) => (openGroups[name] ?? fallback) ? 'open' : '';
 				const held = c.notBefore && c.notBefore > Date.now();
@@ -648,7 +674,7 @@
 					</details>
 
 					<details class="group" data-g="run" ${open('run', false)}>
-						<summary>How it runs<span class="n">${esc(c.agent || snapshot.config.defaultAgent)}${c.dependencies.length ? ` · ${c.dependencies.length} dep${c.dependencies.length > 1 ? 's' : ''}` : ''}</span></summary>
+						<summary>How it runs<span class="n">${esc(cardAgent)}${c.model ? ` · ${esc(c.model)}` : ''}${c.dependencies.length ? ` · ${c.dependencies.length} dep${c.dependencies.length > 1 ? 's' : ''}` : ''}</span></summary>
 						<div class="group-body">
 							<div class="grid">
 								<div><label for="f-prio">Priority</label><input id="f-prio" type="number" value="${c.priority}" /></div>
@@ -662,6 +688,29 @@
 								<option value="">default (${esc(snapshot.config.defaultAgent)})</option>
 								${(snapshot.config.agents || []).map((a) => `<option ${c.agent === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}
 							</select>
+							<label for="f-model">Model</label>
+							<select id="f-model" ${modelLocked || !agentTakesModel ? `disabled title="${esc(whyModel)}"` : ''}>
+								<option value="">${esc(cardAgent)}'s own default</option>
+								${(modelMenu ? modelMenu.models : (snapshot.config.models || {}).choices || [])
+									.map((m) => {
+										const available = m.selector !== undefined ? Boolean(m.selector) : true;
+										// The card's own model stays selectable even when it has gone missing
+										// from the catalog: hiding it would silently rewrite the card on save.
+										const chosen = c.model === m.id;
+										const label = `${m.label}${m.selector ? ` — ${m.selector}` : ''}${m.isDefault ? ' (default)' : ''}`;
+										return `<option value="${esc(m.id)}" ${chosen ? 'selected' : ''} ${!available && !chosen ? `disabled title="${esc(m.reason || 'not available')}"` : ''}>${esc(available ? label : `${m.label} — unavailable`)}</option>`;
+									})
+									.join('')}
+							</select>
+							${
+								whyModel
+									? `<div class="hint">${esc(whyModel)}.</div>`
+									: modelMenu && modelMenu.error
+										? `<div class="hint" style="color:var(--warn)">${esc(modelMenu.error)}</div>`
+										: modelMenu && modelMenu.stale
+											? '<div class="hint" style="color:var(--warn)">Showing the last catalog that could be read — the newest fetch failed.</div>'
+											: ''
+							}
 							<label for="f-deps">Waits for — card ids, comma separated</label>
 							<input id="f-deps" value="${esc(c.dependencies.join(','))}" placeholder="card_a, card_b" />
 							<div class="grid">
@@ -896,6 +945,7 @@
 						maxAttempts: Number(val('f-max')),
 						repo: val('f-repo') || null,
 						agent: val('f-agent') || null,
+						model: val('f-model') || null,
 						dependencies: val('f-deps').split(',').map((s) => s.trim()).filter(Boolean),
 						repeatEveryMs: everyMs,
 					};
@@ -911,6 +961,8 @@
 					return reportSave(e.message, 'bad');
 				}
 				saving = false;
+				// The agent may have changed with this save, and the menu is per agent.
+				modelCache = { agent: null, menu: null };
 				// Drop the baseline first: the poll refuses to redraw while the form looks
 				// dirty, so without this the panel keeps saying "Unsaved changes" and the
 				// header keeps showing the values you just replaced.

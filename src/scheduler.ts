@@ -425,6 +425,8 @@ export class Scheduler extends EventEmitter {
 				worktreeId: null,
 				commitSha: null,
 				summary: null,
+				model: card.model,
+				modelSelector: null,
 				error: `Executor threw: ${(err as Error).message}`,
 				agentResponse: null,
 				filesChanged: [],

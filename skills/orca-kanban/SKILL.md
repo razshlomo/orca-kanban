@@ -59,7 +59,33 @@ kanban card add "<short imperative title>" \
 ```
 
 Useful flags: `--state Ready`, `--deps card_a,card_b`, `--agent omp|codex|claude`,
-`--max-attempts 2`.
+`--max-attempts 2`, `--model <name>`.
+
+### Which model a card runs on
+
+Cards carry a model **name**, not a version — `opus`, `sonnet`, `haiku`, `fable`,
+`sol`. The name is resolved to the newest matching model when the card runs, so it
+keeps working as versions change. A new card gets the configured default (Opus)
+automatically; pass `--model` only when the user asks for a specific one, and
+`--model none` when they want the agent's own default.
+
+```bash
+kanban models                     # the menu, and what each name means today
+kanban card add "…" --model sonnet
+kanban card update <id> --model haiku
+```
+
+Do not invent model names. A name outside the menu, or one the provider has not
+shipped yet, is refused with exit code 4 — read the reason instead of retrying:
+
+- `not in the model menu (have: …)` → use one of those, or ask the user.
+- `may not be released yet — try: kanban models --refresh` → the name is real but the
+  agent's catalog does not have it. Run the refresh once; if it still fails, tell the
+  user it is not available yet rather than picking a different model for them.
+- `cannot be told which model to use` → that agent (claude, codex, cursor) takes no
+  model. Either leave the model unset or use `omp`.
+
+A running card's model cannot be changed, same as its repo and agent.
 
 ### Repo requirement
 
@@ -160,6 +186,7 @@ Rewrite the card instead of adding a second one that says it better:
 ```bash
 kanban card update <id> --acceptance "429 after 5 attempts" --priority 20
 kanban card update <id> --deps card_a,card_b     # replaces the list
+kanban card update <id> --model sonnet           # refused while the card is running
 kanban card update <id> --repo none              # "none" clears a nullable field
 ```
 
@@ -169,9 +196,9 @@ Same options as `card add`, plus `--title`. It does not move cards — that is
 Two edits are refused with exit code 4, and the reason is worth reading rather than
 forcing past:
 
-- `--repo`, `--agent`, `--deps` or `--max-attempts` on a card that is **In Progress or
-  held by hand**. An agent is working from those right now. Text and priority still edit
-  fine, so fixing a description mid-run is fine.
+- `--repo`, `--agent`, `--model`, `--deps` or `--max-attempts` on a card that is **In
+  Progress or held by hand**. An agent is working from those right now. Text and
+  priority still edit fine, so fixing a description mid-run is fine.
 - `--repo` on a card that **already has a worktree**. The branch lives in the old repo;
   land or drop the card first.
 

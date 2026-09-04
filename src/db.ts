@@ -177,6 +177,25 @@ const MIGRATIONS: string[] = [
 	ALTER TABLE cards ADD COLUMN landed_sha TEXT;
 	ALTER TABLE cards ADD COLUMN landed_at INTEGER;
 	`,
+	// v7 — the model a card runs on, and the agent catalogs used to check it.
+	`
+	/* A short alias from config.models.choices ("opus", "sol"), not a pinned version:
+	   the alias is resolved against the agent's own catalog when the card runs, so a
+	   card queued today runs whatever that name means on the day it executes. NULL
+	   leaves the model to the agent's own default, which is how every card behaved
+	   before this column existed. */
+	ALTER TABLE cards ADD COLUMN model TEXT;
+
+	/* One agent's model catalog, as reported by its own CLI. Cached in the board so
+	   the CLI, the server and the scheduler share a single fetch instead of paying
+	   seconds each; a stale copy is still better than refusing a card because the
+	   agent's binary hiccuped, so nothing here is ever deleted, only replaced. */
+	CREATE TABLE model_catalog (
+		agent      TEXT PRIMARY KEY,
+		models     TEXT NOT NULL,
+		fetched_at INTEGER NOT NULL
+	);
+	`,
 ];
 
 /**

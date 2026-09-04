@@ -63,6 +63,39 @@ test('every field carries a real label, not just a placeholder', () => {
 	assert.deepEqual(unlabelled, [], 'a placeholder is not a label');
 });
 
+test('the model select is part of the card form, and is saved with it', () => {
+	assert.match(html, /<select id="f-model"/, 'the panel really has a model control');
+	assert.match(script, /\['f-model', 'model'\]/, 'it is in FIELDS, so dirty state and Revert include it');
+
+	const save = script.slice(script.indexOf('async function saveCard'), script.indexOf('function revertCard'));
+	assert.match(save, /model: val\('f-model'\) \|\| null/, 'an empty choice means the agent default, not ""');
+});
+
+test('the model cannot be changed while an agent is running on it', () => {
+	// The board refuses this edit with a 409, so offering it here would be a lie the
+	// user only discovers on save.
+	assert.match(script, /const modelLocked = running \|\| mine/);
+	assert.match(html, /id="f-model" \$\{modelLocked \|\| !agentTakesModel \? `disabled title=/);
+	// And every disabled state names its reason rather than going quiet.
+	assert.match(script, /cannot be told which model to use/);
+	assert.match(script, /stop the card to change it/);
+});
+
+test('an unavailable model is shown and disabled, never silently dropped', () => {
+	const select = html.slice(html.indexOf('id="f-model"'), html.indexOf('id="f-deps"'));
+	assert.match(select, /disabled title="\$\{esc\(m\.reason/, 'the reason travels with the option');
+	assert.match(select, /unavailable/, 'and it says so in the option text');
+	// A card whose model has been withdrawn must still show it, or saving would quietly
+	// rewrite the card to something else.
+	assert.match(select, /!available && !chosen/);
+});
+
+test('the resolved menu is fetched per agent and cached, not on every poll', () => {
+	assert.match(script, /modelCache = \{ agent: null, menu: null \}/);
+	assert.match(script, /api\(`\/api\/models\?agent=\$\{encodeURIComponent\(cardAgent\)\}`\)/);
+	assert.match(script, /if \(agentTakesModel && modelCache\.agent !== cardAgent\)/, 'one fetch per agent');
+});
+
 test('the card panel is a scrolling body between a fixed head and action bar', () => {
 	// The Save button must not be able to scroll out of reach on a long card.
 	for (const cls of ['p-head', 'p-body', 'p-foot']) {

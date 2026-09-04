@@ -10,6 +10,7 @@ import type {
 	CardInput,
 	CardRun,
 	CardState,
+	CatalogModel,
 	ExecutionResult,
 	RunStatus,
 	SchedulerStatus,
@@ -48,14 +49,14 @@ export class BoardRuleError extends Error {
 const REVIEWABLE: readonly CardState[] = ['Review', 'Blocked'];
 
 /**
- * What a live run is built on: its worktree, its agent, its retry budget, its column,
- * and the dependencies that let it be picked at all. Changing any of these while an
- * agent holds the card either orphans that session or contradicts the prompt it was
- * already given, so they are refused mid-run. Text and priority are not on the list:
- * the pick already happened and the prompt is already delivered, so editing them is
- * only bookkeeping.
+ * What a live run is built on: its worktree, its agent and model, its retry budget,
+ * its column, and the dependencies that let it be picked at all. Changing any of these
+ * while an agent holds the card either orphans that session or contradicts the prompt
+ * it was already given, so they are refused mid-run. Text and priority are not on the
+ * list: the pick already happened and the prompt is already delivered, so editing them
+ * is only bookkeeping.
  */
-const RUN_CRITICAL = ['state', 'repo', 'agent', 'dependencies', 'maxAttempts'] as const;
+const RUN_CRITICAL = ['state', 'repo', 'agent', 'model', 'dependencies', 'maxAttempts'] as const;
 type RunCriticalField = (typeof RUN_CRITICAL)[number];
 
 /**
@@ -111,6 +112,7 @@ function rowToCard(row: Row): Card {
 		dependencies,
 		repo: (row['repo'] as string | null) ?? null,
 		agent: (row['agent'] as string | null) ?? null,
+		model: (row['model'] as string | null) ?? null,
 		createdAt: Number(row['created_at']),
 		updatedAt: Number(row['updated_at']),
 		// Seeded from updated_at by the v4 migration, so it is never null in practice; the
@@ -323,9 +325,9 @@ export class Board extends EventEmitter {
 		this.db
 			.prepare(
 				`INSERT INTO cards (id, title, description, acceptance_criteria, state, priority, board_order,
-				 dependencies, repo, agent, created_at, updated_at, attempt_count, max_attempts,
+				 dependencies, repo, agent, model, created_at, updated_at, attempt_count, max_attempts,
 				 not_before, repeat_every_ms)
-				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)`,
+				 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)`,
 			)
 			.run(
 				id,
@@ -338,6 +340,7 @@ export class Board extends EventEmitter {
 				JSON.stringify(input.dependencies ?? []),
 				input.repo ?? null,
 				input.agent ?? null,
+				input.model ?? null,
 				now,
 				now,
 				input.maxAttempts ?? 2,
@@ -370,6 +373,7 @@ export class Board extends EventEmitter {
 		if (patch.dependencies !== undefined) columns['dependencies'] = JSON.stringify(patch.dependencies);
 		if (patch.repo !== undefined) columns['repo'] = patch.repo;
 		if (patch.agent !== undefined) columns['agent'] = patch.agent;
+		if (patch.model !== undefined) columns['model'] = patch.model;
 		if (patch.maxAttempts !== undefined) columns['max_attempts'] = patch.maxAttempts;
 		if (patch.notBefore !== undefined) columns['not_before'] = patch.notBefore;
 		if (patch.repeatEveryMs !== undefined) columns['repeat_every_ms'] = patch.repeatEveryMs;
@@ -920,6 +924,40 @@ export class Board extends EventEmitter {
 		this.touched('card_interrupted', id);
 	}
 
+	// -------------------------------------------------------- model catalogs
+
+	/**
+	 * The last model catalog read from an agent's CLI, or null when never read.
+	 *
+	 * Kept in the board rather than in memory because three processes ask the same
+	 * question — `kanban card add`, the server and the scheduler — and listing models
+	 * costs seconds of subprocess time each.
+	 */
+	modelCatalog(agent: string): { models: CatalogModel[]; fetchedAt: number } | null {
+		const row = this.db.prepare('SELECT models, fetched_at FROM model_catalog WHERE agent = ?').get(agent) as
+			| Row
+			| undefined;
+		if (!row) return null;
+
+		try {
+			const parsed: unknown = JSON.parse(String(row['models'] ?? '[]'));
+			if (!Array.isArray(parsed)) return null;
+			return { models: parsed as CatalogModel[], fetchedAt: Number(row['fetched_at']) };
+		} catch {
+			// A corrupt cache is a cache miss, never a crash: the next fetch replaces it.
+			return null;
+		}
+	}
+
+	saveModelCatalog(agent: string, models: CatalogModel[]): void {
+		this.db
+			.prepare(
+				`INSERT INTO model_catalog (agent, models, fetched_at) VALUES (?,?,?)
+				 ON CONFLICT(agent) DO UPDATE SET models = excluded.models, fetched_at = excluded.fetched_at`,
+			)
+			.run(agent, JSON.stringify(models), Date.now());
+	}
+
 	// ------------------------------------------------------------------ runs
 
 	startRun(cardId: string, sessionId: string | null): CardRun {
@@ -1040,6 +1078,10 @@ export class Board extends EventEmitter {
 				error: result.error,
 				details: {
 					completionReason: result.completionReason,
+					// The alias the card asked for AND the version it actually ran on: the
+					// alias moves with the catalog, so history is only exact if it keeps both.
+					model: result.model,
+					modelSelector: result.modelSelector,
 					filesChanged: result.filesChanged,
 					testsRun: result.testsRun,
 					lint: result.lint,

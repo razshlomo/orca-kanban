@@ -59,6 +59,8 @@ export function okResult(runId: string, over: Partial<ExecutionResult> = {}): Ex
 		lint: null,
 		typecheck: null,
 		concerns: null,
+		model: null,
+		modelSelector: null,
 		startedAt: now,
 		finishedAt: now,
 		...over,
@@ -90,6 +92,8 @@ export type FakeOrcaOptions = {
 
 export type FakeOrca = OrcaApi & {
 	calls: string[];
+	/** Text typed into an agent, in order — how a prompt reaches a TUI agent. */
+	sentText: string[];
 	psCallCount: number;
 	statusWrites: Array<{ selector: string; workspaceStatus: string | null; comment: string | null }>;
 	/**
@@ -136,6 +140,7 @@ export function agentRow(state: string | null, over: Partial<OrcaWorktreeStatus[
 /** In-memory stand-in for the Orca CLI. */
 export function fakeOrca(options: FakeOrcaOptions = {}): FakeOrca {
 	const calls: string[] = [];
+	const sentText: string[] = [];
 	const statusWrites: FakeOrca['statusWrites'] = [];
 	const columns: FakeOrca['columns'] = {};
 	const frames = options.psFrames ?? [[worktreeRow({ agents: [agentRow('done')] })]];
@@ -144,6 +149,7 @@ export function fakeOrca(options: FakeOrcaOptions = {}): FakeOrca {
 
 	const api: FakeOrca = {
 		calls,
+		sentText,
 		statusWrites,
 		columns,
 		psCallCount: 0,
@@ -166,7 +172,9 @@ export function fakeOrca(options: FakeOrcaOptions = {}): FakeOrca {
 				id: `repo::${wtPath}`,
 				path: wtPath,
 				branch: 'refs/heads/fake',
-				agentTerminalHandle: 'term_fake',
+				// Orca only returns an agent terminal when it launched one, so a create
+				// without `--agent` must leave the caller to open its own terminal.
+				agentTerminalHandle: opts.agentId ? 'term_fake' : null,
 			};
 		},
 		async worktreeRemove(selector) {
@@ -196,6 +204,7 @@ export function fakeOrca(options: FakeOrcaOptions = {}): FakeOrca {
 		},
 		async terminalSend(opts) {
 			calls.push(`terminalSend:${opts.interrupt ? 'interrupt' : 'text'}`);
+			if (opts.text !== undefined) sentText.push(opts.text);
 		},
 		async terminalWait(opts) {
 			calls.push('terminalWait');

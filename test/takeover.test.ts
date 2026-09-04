@@ -31,6 +31,7 @@ function card(over: Partial<Card> = {}): Card {
 		dependencies: [],
 		repo: '/tmp/repo',
 		agent: null,
+		model: null,
 		createdAt: now,
 		updatedAt: now,
 		stateChangedAt: now,

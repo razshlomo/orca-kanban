@@ -188,6 +188,7 @@ kanban card add "Add rate limiting to /login" \
   --deps card_ab12cd34 \
   --repo /Users/you/src/api \
   --agent omp \
+  --model opus \
   --max-attempts 2
 ```
 
@@ -203,10 +204,66 @@ kanban card rm <id>
 kanban status
 kanban recover
 kanban run [--once]
+kanban models [--refresh]          # the model menu, and what each name means today
 ```
 
 Cards default to **Backlog**. Only **Ready** cards are ever executed, so Backlog is your
 staging area. The UI (`+ Card`, then drag) and the HTTP API do the same thing.
+
+### Choosing a model
+
+A card stores a **name**, never a version:
+
+```bash
+kanban models
+# agent: omp · catalog read just now
+# fable    Fable            anthropic/claude-fable-5-1 (newest of 2)
+# opus     Opus           * anthropic/claude-opus-5 (newest of 7)
+# sonnet   Sonnet           anthropic/claude-sonnet-5 (newest of 4)
+# haiku    Haiku            anthropic/claude-haiku-4-5
+# sol      Sol (codex)      openai-codex/gpt-5.6-sol
+# astra    Astra (codex)    openai-codex/gpt-6-astra
+```
+
+`opus` meant Opus 4.5 in November and means Opus 5 now, with nothing to edit in between:
+the name is resolved against the agent's own catalog when the card runs, newest match
+wins, and dated snapshots (`claude-opus-4-1-20250805`) and variants (`-fast`, `-high`)
+never win over the plain name. The `*` marks what a new card gets (`models.default`).
+
+**A name that does not resolve is refused, not guessed.** A model can sit in the menu
+before the provider ships it; picking it then fails with the reason, at card create and
+again before launch:
+
+```
+"astra" matches no model in omp's catalog (looking for "astra"). It may not be
+released yet — try: kanban models --refresh. Working now: fable, opus, sonnet, haiku, sol.
+```
+
+That is exactly how `astra` behaved before it landed, and `kanban models --refresh` was
+the whole migration — it re-reads the agent's catalog (running `omp models refresh`
+first) and the same name starts resolving, here to `openai-codex/gpt-6-astra`.
+
+Other rules worth knowing:
+
+- **Only an agent that can list its models may be given one.** Orca's `worktree create`
+  takes `--agent` and `--prompt` and has no model option, so a card with a model is
+  started as the agent's own command instead (`modelCommand`, e.g.
+  `omp --auto-approve --model {{model}} {{promptFileRel}}`). Verified against the real
+  CLI: the agent sends that message itself, and `orca worktree ps` reports it as a
+  tracked agent with its state and final message — so completion, take-over and the
+  summary all behave as on the native path. Out of the box that is `omp`; a claude or
+  codex card is refused with a pointer rather than run on the wrong model. Add
+  `modelCommand` + `modelsCommand` to an agent in `config.json` to enable it there.
+- **The default is written onto the card at creation**, so a card queued today cannot
+  change model because a setting changed while it waited. `--model none` opts out and
+  leaves the choice to the agent, which is how every card behaved before this existed.
+- **The model cannot be changed while the card is running** or held by hand — it is what
+  the live agent is running on. The UI disables the select with that reason.
+- The catalog is cached in the board for 12 hours and shared by the CLI, the server and
+  the scheduler, so validating a model costs one subprocess per half day. A failed fetch
+  falls back to the last catalog rather than blocking cards, and says it is stale.
+- The concrete model each attempt ran on is recorded with the run, so history says
+  `opus → anthropic/claude-opus-5` and not just "opus".
 
 ### Editing a card
 

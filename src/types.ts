@@ -46,6 +46,13 @@ export type Card = {
   /** Orca repo selector or absolute path; falls back to config.defaultRepo. */
   repo: string | null;
   agent: string | null;
+  /**
+   * Which model the agent should run, as a short alias from `config.models.choices`
+   * (`opus`, `sol`), never a pinned version. The alias is resolved against the agent's
+   * own catalog at launch, so a card queued today runs whatever that name means then.
+   * `null` leaves the choice to the agent's own default.
+   */
+  model: string | null;
   createdAt: number;
   updatedAt: number;
   /**
@@ -114,6 +121,7 @@ export type CardInput = {
   dependencies?: string[];
   repo?: string | null;
   agent?: string | null;
+  model?: string | null;
   maxAttempts?: number;
   notBefore?: number | null;
   repeatEveryMs?: number | null;
@@ -207,6 +215,9 @@ export type ExecutionResult = {
   lint: string | null;
   typecheck: string | null;
   concerns: string | null;
+  /** The alias the card asked for, and the concrete model it resolved to. */
+  model: string | null;
+  modelSelector: string | null;
   startedAt: number;
   finishedAt: number;
 };
@@ -233,6 +244,63 @@ export type AgentConfig = {
    * `null` for agents with no resume story; the UI disables the button and says so.
    */
   resumeCommand: string | null;
+  /**
+   * Launch command used when a card names a model. Orca's own `--agent` launch has no
+   * way to carry one (`orca worktree create` takes `--agent` and `--prompt`, nothing
+   * else), so a card with a model is started as a plain terminal command instead.
+   * Same substitutions as `fallbackCommand`, plus `{{model}}`.
+   *
+   * Verified against the real CLI: `omp --auto-approve --model <selector> @<file>`
+   * started as a terminal command sends that message itself, does the work, and is
+   * reported by `orca worktree ps` as a tracked agent (`agentType`, `state`,
+   * `lastAssistantMessage`) — so nothing the board watches is lost by not using
+   * Orca's own `--agent` launch, which cannot carry a model.
+   *
+   * `null` means this agent cannot be asked for a model, and a card that names one is
+   * refused rather than launched on the wrong model.
+   */
+  modelCommand: string | null;
+  /**
+   * Command that prints this agent's model catalog, and how to read its output.
+   * `json` walks the parsed output collecting `selector`/`id`; `lines` takes the first
+   * token of each line. A model is only "available" if it is in this catalog, so an
+   * agent without one cannot take a model at all.
+   */
+  modelsCommand: string | null;
+  modelsFormat: 'json' | 'lines';
+  /** Run before a forced re-fetch, for agents that cache their catalog locally. */
+  modelsRefreshCommand: string | null;
+};
+
+/**
+ * One model as an agent's own CLI reports it. Cached per agent in the board, and the
+ * only source of truth for "does this model exist": the board never guesses a model
+ * name, it either finds it in this catalog or refuses the card.
+ */
+export type CatalogModel = {
+  provider: string;
+  /** Model id within the provider, e.g. `claude-opus-5`. */
+  id: string;
+  /** Fully qualified name passed to the agent, e.g. `anthropic/claude-opus-5`. */
+  selector: string;
+  label: string;
+};
+
+/**
+ * One entry in the model menu.
+ *
+ * `match` is a substring of the agent catalog's model selector; among the matches the
+ * newest version wins (dated snapshots and `-fast`/`-high` variants lose to the plain
+ * name). `selector` pins a version instead, for reproducing something on an old model.
+ */
+export type ModelChoice = {
+  /** Stored on the card and passed to the agent, e.g. `opus`. */
+  id: string;
+  label: string;
+  match: string;
+  /** Provider preference; empty means any provider in the catalog. */
+  providers: string[];
+  selector?: string | null;
 };
 
 export type KanbanConfig = {
@@ -312,6 +380,19 @@ export type KanbanConfig = {
     runId: string | null;
   };
   agents: Record<string, AgentConfig>;
+  /**
+   * The model menu: short names a card may ask for, plus which one new cards get.
+   *
+   * Named, not pinned, on purpose — model versions move every few weeks, so a choice
+   * describes *which family* it means and the newest matching model in the agent's
+   * catalog wins. A name that matches nothing yet (a model announced but not shipped)
+   * stays in the menu and is refused with that reason until the catalog has it.
+   */
+  models: {
+    /** Alias applied to new cards, when their agent can take a model. */
+    default: string | null;
+    choices: ModelChoice[];
+  };
 };
 
 export type SchedulerRunState = 'stopped' | 'idle' | 'running' | 'paused' | 'stopping';
