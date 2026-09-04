@@ -46,6 +46,32 @@ export class BoardRuleError extends Error {
 
 /** States a human verdict can be applied to: the card has run, or has given up. */
 const REVIEWABLE: readonly CardState[] = ['Review', 'Blocked'];
+
+/**
+ * What a live run is built on: its worktree, its agent, its retry budget, its column,
+ * and the dependencies that let it be picked at all. Changing any of these while an
+ * agent holds the card either orphans that session or contradicts the prompt it was
+ * already given, so they are refused mid-run. Text and priority are not on the list:
+ * the pick already happened and the prompt is already delivered, so editing them is
+ * only bookkeeping.
+ */
+const RUN_CRITICAL = ['state', 'repo', 'agent', 'dependencies', 'maxAttempts'] as const;
+type RunCriticalField = (typeof RUN_CRITICAL)[number];
+
+/**
+ * True when a patch actually moves a field rather than restating it.
+ *
+ * The UI saves the whole card on every edit, so the question "did this change the
+ * repo" can only be answered against the stored value — otherwise renaming a running
+ * card would be refused for a repo it never touched.
+ */
+function isChange(card: Card, patch: Partial<CardInput> & { state?: CardState }, field: RunCriticalField): boolean {
+	const next = patch[field];
+	if (next === undefined) return false;
+	if (field === 'dependencies') return JSON.stringify(next) !== JSON.stringify(card.dependencies);
+	return (next as unknown) !== (card as unknown as Record<string, unknown>)[field];
+}
+
 /** Tolerates a missing or malformed column: an unreadable slot list is not a crash. */
 function parseInFlight(raw: unknown): SchedulerStatus['inFlight'] {
 	if (typeof raw !== 'string' || raw === '') return [];
@@ -325,9 +351,14 @@ export class Board extends EventEmitter {
 		return card;
 	}
 
-	updateCard(id: string, patch: Partial<CardInput> & { state?: CardState }): Card | null {
+	updateCard(
+		id: string,
+		patch: Partial<CardInput> & { state?: CardState },
+		options: { force?: boolean } = {},
+	): Card | null {
 		const existing = this.getCard(id);
 		if (!existing) return null;
+		if (!options.force) this.refuseUnsafeEdit(existing, patch);
 
 		const columns: Record<string, SqlValue> = {};
 		if (patch.title !== undefined) columns['title'] = patch.title;
@@ -363,6 +394,39 @@ export class Board extends EventEmitter {
 			card.id,
 			card.state,
 		);
+	}
+
+	/**
+	 * Refuses an edit the board cannot honour: one that changes what a live run is
+	 * built on, or that repoints a card whose worktree already exists.
+	 */
+	private refuseUnsafeEdit(card: Card, patch: Partial<CardInput> & { state?: CardState }): void {
+		// A worktree lives in the repo its branch was cut from, and diff, land, drop and
+		// resume all resolve through the card's repo — repointing it orphans the branch
+		// and makes every one of those commands look at the wrong tree.
+		if (isChange(card, patch, 'repo') && card.worktreePath !== null) {
+			throw new BoardRuleError(
+				`Cannot change the repo of ${card.id}: its worktree is already at ${card.worktreePath}. ` +
+					`Land or drop the card first.`,
+				card.id,
+				card.state,
+			);
+		}
+
+		const critical = RUN_CRITICAL.filter((field) => isChange(card, patch, field));
+		if (critical.length === 0) return;
+
+		// A held card is In Progress too, but "it is running" is the wrong thing to tell
+		// the person who is the one holding it.
+		if (card.manualSince !== null) {
+			throw new BoardRuleError(
+				`Cannot change ${critical.join(', ')} on ${card.id}: you are holding this card by hand. Take it back first.`,
+				card.id,
+				card.state,
+			);
+		}
+
+		this.refuseWhileRunning(card, `change ${critical.join(', ')} on ${card.id}`);
 	}
 
 	/** A verdict only means something once the card has produced an outcome. */

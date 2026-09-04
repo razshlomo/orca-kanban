@@ -16,7 +16,7 @@ import {
 	uninstallService,
 } from './service.ts';
 import { createHttpServer } from './server.ts';
-import { isCardState, type CardInput, type CardState } from './types.ts';
+import { isCardState, type Card, type CardInput, type CardState } from './types.ts';
 
 const USAGE = `orca-kanban — Kanban-driven sequential agent execution for Orca
 
@@ -27,6 +27,7 @@ Usage:
   orca-kanban card add <title> [options]         Create a card
   orca-kanban card list [--state <state>]        List cards
   orca-kanban card show <id>                     Show one card and its run history
+  orca-kanban card update <id> [options]         Edit a card's fields ("none" clears one)
   orca-kanban card move <id> <state>             Move a card between columns
   orca-kanban card rm <id>                       Delete a card
   orca-kanban card retry <id>                    Return a failed/blocked card to Ready
@@ -52,6 +53,7 @@ Card options:
   --deps <id,id>         --repo <path|id:…>    --agent <name>
   --max-attempts <n>     --state <state>       --force (override card-worktree guard)
   --not-before <7d|ISO>  hold until due        --every <1w>  re-run on that interval
+  --title <text>         update only; --state is not accepted there, use card move
 
 States: Backlog | Ready | "In Progress" | Review | Done | Blocked
 `;
@@ -103,6 +105,67 @@ function flagNum(args: Args, key: string): number | undefined {
 function requireState(value: string | undefined): CardState {
 	if (!isCardState(value)) throw new Error(`invalid state "${value ?? ''}"`);
 	return value;
+}
+
+/** Every `card update` flag that means nothing without a value. */
+const UPDATE_FLAGS = [
+	'title',
+	'description',
+	'acceptance',
+	'priority',
+	'max-attempts',
+	'deps',
+	'repo',
+	'agent',
+	'not-before',
+	'every',
+] as const;
+
+/** `none` (or an emptied value) clears a nullable field; anything else is the new value. */
+function clearable(value: string): string | null {
+	const trimmed = value.trim();
+	return trimmed === '' || trimmed.toLowerCase() === 'none' ? null : trimmed;
+}
+
+const FIELD_LABEL: Record<string, string> = {
+	acceptanceCriteria: 'acceptance',
+	maxAttempts: 'max-attempts',
+	dependencies: 'deps',
+	notBefore: 'not-before',
+	repeatEveryMs: 'every',
+};
+
+function renderField(card: Card, field: keyof CardInput): string {
+	if (field === 'dependencies') return card.dependencies.length > 0 ? card.dependencies.join(',') : '(none)';
+	if (field === 'notBefore') {
+		return card.notBefore === null ? '(none)' : `${new Date(card.notBefore).toISOString()} (${formatRelative(card.notBefore)})`;
+	}
+	if (field === 'repeatEveryMs') {
+		if (card.repeatEveryMs === null) return '(none)';
+		// Echo the interval in the syntax it was typed in, not in milliseconds.
+		const units: [string, number][] = [['w', 604_800_000], ['d', 86_400_000], ['h', 3_600_000], ['m', 60_000]];
+		const unit = units.find(([, size]) => card.repeatEveryMs !== null && card.repeatEveryMs % size === 0);
+		return unit ? `${card.repeatEveryMs / unit[1]}${unit[0]}` : `${card.repeatEveryMs}ms`;
+	}
+
+	const value = (card as unknown as Record<string, unknown>)[field];
+	if (value === null || value === '') return '(none)';
+	const text = String(value);
+	return text.length > 60 ? `${text.slice(0, 57)}…` : text;
+}
+
+/**
+ * What actually moved on the card, so the output is the edit rather than the flags
+ * that were typed: re-passing a value it already had reports no change.
+ */
+function describeCardChanges(before: Card, after: Card, fields: (keyof CardInput)[]): string[] {
+	const out: string[] = [];
+	for (const field of fields) {
+		const was = renderField(before, field);
+		const now = renderField(after, field);
+		if (was !== now) out.push(`${FIELD_LABEL[field] ?? field}: ${was} → ${now}`);
+	}
+	return out;
 }
 
 async function main(): Promise<number> {
@@ -298,6 +361,117 @@ async function main(): Promise<number> {
 					`${card.id}  ${card.state}  P${card.priority}  ${card.title}` +
 						`${schedule.length > 0 ? `  (${schedule.join(', ')})` : ''}\n`,
 				);
+				return 0;
+			}
+
+			if (sub === 'update') {
+				const id = args._[2];
+				if (!id) throw new Error('a card id is required');
+				const before = app.board.getCard(id);
+				if (!before) throw new Error(`no such card ${id}`);
+				const force = args.flags['force'] === true;
+
+				// Moving a card is `card move`: that clears the claim and re-arms a recurring
+				// card, and an update writing the state column directly would do neither.
+				if (args.flags['state'] !== undefined) {
+					throw new Error(`card update does not move cards — use: kanban card move ${id} <state>`);
+				}
+				// A flag with no value parses as a boolean, which would otherwise be dropped
+				// and report "no changes" for an edit the user believes they made.
+				for (const key of UPDATE_FLAGS) {
+					if (args.flags[key] === true) throw new Error(`--${key} needs a value (pass "none" to clear it)`);
+				}
+
+				const patch: Partial<CardInput> = {};
+				const title = flagStr(args, 'title');
+				if (title !== undefined) {
+					if (!title.trim()) throw new Error('a card title cannot be empty');
+					patch.title = title.trim();
+				}
+
+				const description = flagStr(args, 'description');
+				if (description !== undefined) patch.description = description;
+
+				const acceptance = flagStr(args, 'acceptance');
+				if (acceptance !== undefined) patch.acceptanceCriteria = acceptance;
+
+				const priority = flagNum(args, 'priority');
+				if (priority !== undefined) {
+					if (!Number.isInteger(priority)) throw new Error(`--priority must be a whole number, got "${flagStr(args, 'priority') ?? ''}"`);
+					patch.priority = priority;
+				}
+
+				const maxAttempts = flagNum(args, 'max-attempts');
+				if (maxAttempts !== undefined) {
+					if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+						throw new Error(`--max-attempts must be a whole number of at least 1, got "${flagStr(args, 'max-attempts') ?? ''}"`);
+					}
+					patch.maxAttempts = maxAttempts;
+				}
+
+				const repo = flagStr(args, 'repo');
+				if (repo !== undefined) patch.repo = clearable(repo);
+
+				const agent = flagStr(args, 'agent');
+				if (agent !== undefined) patch.agent = clearable(agent);
+
+				const deps = flagStr(args, 'deps');
+				if (deps !== undefined) {
+					const ids = (clearable(deps) ?? '')
+						.split(',')
+						.map((s) => s.trim())
+						.filter(Boolean);
+					if (ids.includes(id)) throw new Error(`${id} cannot depend on itself`);
+					// A dependency that does not exist is never Done, so the card would wait in
+					// Ready forever with nothing to show for it but "waiting on card_typo".
+					const unknown = ids.filter((dep) => !app.board.getCard(dep));
+					if (unknown.length > 0 && !force) {
+						throw new Error(
+							`no such card ${unknown.join(', ')} — that dependency would park ${id} forever (--force to set it anyway)`,
+						);
+					}
+					patch.dependencies = ids;
+				}
+
+				const notBefore = flagStr(args, 'not-before');
+				if (notBefore !== undefined) {
+					const raw = clearable(notBefore);
+					if (raw === null) patch.notBefore = null;
+					else {
+						const dueAt = parseDueAt(raw);
+						if (dueAt === null) throw new Error(`could not read --not-before "${raw}" — try 7d, 2h, or 2026-08-19`);
+						patch.notBefore = dueAt;
+					}
+				}
+
+				const every = flagStr(args, 'every');
+				if (every !== undefined) {
+					const raw = clearable(every);
+					if (raw === null) patch.repeatEveryMs = null;
+					else {
+						const interval = parseDuration(raw);
+						if (interval === null) throw new Error(`could not read --every "${raw}" — try 1w, 3d, or 12h`);
+						patch.repeatEveryMs = interval;
+					}
+				}
+
+				const fields = Object.keys(patch) as (keyof CardInput)[];
+				if (fields.length === 0) {
+					throw new Error(`nothing to update — pass at least one of ${UPDATE_FLAGS.map((f) => `--${f}`).join(' ')}`);
+				}
+
+				const card = app.board.updateCard(id, patch, { force });
+				if (!card) throw new Error(`no such card ${id}`);
+
+				const changes = describeCardChanges(before, card, fields);
+				process.stdout.write(
+					`${card.id}  ${card.state}  ${changes.length > 0 ? changes.join(', ') : 'no changes'}\n`,
+				);
+				// A repeat is armed by reaching Done, so setting one on a card that is already
+				// there sits inert until the card moves again.
+				if (patch.repeatEveryMs && card.state === 'Done') {
+					process.stderr.write(`note: ${id} is already Done — the repeat arms the next time it reaches Done\n`);
+				}
 				return 0;
 			}
 

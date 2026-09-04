@@ -153,6 +153,31 @@ the reason on the card. Read it before retrying:
 kanban card show <id>
 ```
 
+## Changing a card that is already on the board
+
+Rewrite the card instead of adding a second one that says it better:
+
+```bash
+kanban card update <id> --acceptance "429 after 5 attempts" --priority 20
+kanban card update <id> --deps card_a,card_b     # replaces the list
+kanban card update <id> --repo none              # "none" clears a nullable field
+```
+
+Same options as `card add`, plus `--title`. It does not move cards — that is
+`card move`, which also clears the claim.
+
+Two edits are refused with exit code 4, and the reason is worth reading rather than
+forcing past:
+
+- `--repo`, `--agent`, `--deps` or `--max-attempts` on a card that is **In Progress or
+  held by hand**. An agent is working from those right now. Text and priority still edit
+  fine, so fixing a description mid-run is fine.
+- `--repo` on a card that **already has a worktree**. The branch lives in the old repo;
+  land or drop the card first.
+
+A dependency on a card id that does not exist is rejected too — nothing would ever mark
+it Done, so the card would sit in Ready forever.
+
 ## States
 
 `Backlog` → `Ready` → `In Progress` → `Review` → `Done`, plus `Blocked`.

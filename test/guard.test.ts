@@ -68,7 +68,7 @@ test('a corrupt or incomplete marker is ignored rather than blocking everything'
 });
 
 test('mutating commands are classified correctly', () => {
-	for (const cmd of ['card add', 'card move', 'card rm', 'card retry', 'serve', 'run', 'recover']) {
+	for (const cmd of ['card add', 'card update', 'card move', 'card rm', 'card retry', 'serve', 'run', 'recover']) {
 		assert.ok(isMutatingCommand(cmd), `${cmd} changes the board`);
 	}
 	for (const cmd of ['card list', 'card show', 'status', 'doctor', 'help']) {
@@ -88,6 +88,12 @@ test('board writes are refused inside a card worktree, reads are allowed', () =>
 			return true;
 		},
 		'a card agent must not add cards',
+	);
+
+	assert.throws(
+		() => assertBoardWritable('card update', { cwd: root }),
+		CardWorkerGuardError,
+		'nor edit them — follow-up work belongs in its result file',
 	);
 
 	assert.doesNotThrow(() => assertBoardWritable('card list', { cwd: root }), 'reads stay available');

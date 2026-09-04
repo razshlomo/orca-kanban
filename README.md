@@ -196,6 +196,7 @@ Other commands:
 ```bash
 kanban card list [--state Ready]   # ✓ marks eligible cards
 kanban card show <id>              # card + full run history
+kanban card update <id> --priority 20 --acceptance "…"
 kanban card move <id> Ready
 kanban card retry <id>
 kanban card rm <id>
@@ -206,6 +207,30 @@ kanban run [--once]
 
 Cards default to **Backlog**. Only **Ready** cards are ever executed, so Backlog is your
 staging area. The UI (`+ Card`, then drag) and the HTTP API do the same thing.
+
+### Editing a card
+
+`card update` takes the same options as `card add`, plus `--title`. Pass `none` to clear
+a nullable field (`--repo none`, `--agent none`, `--not-before none`, `--every none`,
+`--deps none`), and the output names only what actually moved:
+
+```bash
+kanban card update card_ab12cd34 --priority 20 --deps card_99 --not-before 2d
+# card_ab12cd34  Ready  priority: 5 → 20, deps: (none) → card_99, not-before: (none) → …
+```
+
+It does not move cards: use `card move`, which also clears the claim and re-arms a
+recurring card. Two edits are refused, with the reason and exit code 4:
+
+- anything a **live run** is built on — `repo`, `agent`, `deps`, `max-attempts` — while
+  the card is In Progress or held by hand. Title, description, acceptance and priority
+  stay editable, because the pick already happened and the prompt is already delivered.
+- `--repo` on a card that **already has a worktree**, in any state. The branch was cut
+  from the old repo, so `diff`, `land`, `drop` and `resume` would all look in the wrong
+  place. Land or drop it first.
+
+A dependency id that does not exist is rejected too: nothing would ever mark it Done, so
+the card would wait in Ready forever. `--force` overrides all of these deliberately.
 
 ### Eligibility
 

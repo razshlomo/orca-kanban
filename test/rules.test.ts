@@ -185,6 +185,77 @@ test('a deliberate force can still delete a running card', () => {
 	board.close();
 });
 
+test('a running card refuses the edits its live run is built on, and allows the rest', () => {
+	const { board } = testBoard();
+	const card = board.createCard({ title: 'x', state: 'Ready', repo: '/tmp/one', maxAttempts: 2 });
+	const other = board.createCard({ title: 'dep', state: 'Ready' });
+	board.claimCard(card.id, 'worker-1');
+
+	for (const patch of [
+		{ repo: '/tmp/two' },
+		{ agent: 'codex' },
+		{ maxAttempts: 5 },
+		{ dependencies: [other.id] },
+		{ state: 'Done' as CardState },
+	]) {
+		assert.throws(
+			() => board.updateCard(card.id, patch),
+			(err: Error) => err instanceof BoardRuleError && /while it is running/.test(err.message),
+			`${Object.keys(patch)[0]} must not change under a live agent`,
+		);
+	}
+
+	assert.equal(board.getCard(card.id)?.repo, '/tmp/one', 'nothing was written by a refusal');
+
+	// The UI saves the whole card on every edit, so a patch that restates the running
+	// values while changing only text has to go through.
+	const edited = board.updateCard(card.id, {
+		title: 'renamed mid-run',
+		description: 'more detail',
+		priority: 9,
+		repo: '/tmp/one',
+		maxAttempts: 2,
+		dependencies: [],
+	});
+	assert.equal(edited?.title, 'renamed mid-run');
+	assert.equal(edited?.priority, 9);
+
+	assert.equal(board.updateCard(card.id, { repo: '/tmp/two' }, { force: true })?.repo, '/tmp/two', 'force still wins');
+	board.close();
+});
+
+test('a card held by hand says so instead of blaming the agent', () => {
+	const { board } = testBoard();
+	const card = board.createCard({ title: 'x', state: 'Ready' });
+	board.claimCard(card.id, 'worker-1');
+	board.handToHuman(card.id, 'taken over');
+
+	assert.throws(
+		() => board.updateCard(card.id, { agent: 'codex' }),
+		(err: Error) => err instanceof BoardRuleError && /holding this card by hand/.test(err.message),
+	);
+	board.close();
+});
+
+test('repointing the repo of a card that already has a worktree is refused in any state', () => {
+	const { board } = testBoard();
+	const card = board.createCard({ title: 'x', state: 'Review', repo: '/tmp/one' });
+	board.attachSession(card.id, {
+		sessionId: 'sess-1',
+		worktreeId: 'repo::/tmp/wt',
+		worktreePath: '/tmp/wt',
+		branch: 'kanban/x',
+	});
+
+	assert.throws(
+		() => board.updateCard(card.id, { repo: '/tmp/two' }),
+		(err: Error) => err instanceof BoardRuleError && /worktree is already at \/tmp\/wt/.test(err.message),
+	);
+	// The branch is what makes it unsafe, so the rest of the card is still editable.
+	assert.equal(board.updateCard(card.id, { title: 'renamed' })?.title, 'renamed');
+	board.close();
+});
+
 test('moving a card out of In Progress is still allowed, as the escape hatch', () => {
 	const { board } = testBoard();
 	const card = board.createCard({ title: 'x', state: 'Ready' });

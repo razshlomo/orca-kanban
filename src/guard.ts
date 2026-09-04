@@ -87,10 +87,20 @@ export class CardWorkerGuardError extends Error {
 }
 
 /** Commands that change the board or drive the scheduler. */
-const MUTATING = new Set(['card add', 'card move', 'card rm', 'card retry', 'serve', 'run', 'recover', 'service']);
+const MUTATING: Record<string, true> = {
+	'card add': true,
+	'card update': true,
+	'card move': true,
+	'card rm': true,
+	'card retry': true,
+	serve: true,
+	run: true,
+	recover: true,
+	service: true,
+};
 
 export function isMutatingCommand(command: string): boolean {
-	return MUTATING.has(command);
+	return MUTATING[command] === true;
 }
 
 /**

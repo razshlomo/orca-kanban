@@ -129,6 +129,36 @@ test('cards can be created, edited, moved, retried, and deleted over HTTP', asyn
 	}
 });
 
+test('the edit endpoint refuses what a live run is built on, and still takes the rest', async () => {
+	const h = await harness();
+	try {
+		const created = await h.call<CardResponse>('/api/cards', 'POST', {
+			title: 'running',
+			state: 'In Progress',
+			repo: '/tmp/one',
+		});
+		const id = created.json.card.id;
+
+		const refused = await h.call<ErrorResponse>(`/api/cards/${id}`, 'PATCH', { repo: '/tmp/two' });
+		assert.equal(refused.status, 409, 'a board rule is a 409, not a 500');
+		assert.match(refused.json.error, /while it is running/);
+
+		// The panel saves the whole card every time, so restating the running values while
+		// editing text has to stay a 200 or editing a running card becomes impossible.
+		const edited = await h.call<CardResponse>(`/api/cards/${id}`, 'PATCH', {
+			title: 'renamed mid-run',
+			repo: '/tmp/one',
+			dependencies: [],
+			maxAttempts: 2,
+		});
+		assert.equal(edited.status, 200);
+		assert.equal(edited.json.card.title, 'renamed mid-run');
+		assert.equal(edited.json.card.repo, '/tmp/one');
+	} finally {
+		await h.stop();
+	}
+});
+
 test('a card with no title is rejected', async () => {
 	const h = await harness();
 	try {
